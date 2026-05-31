@@ -1,0 +1,8 @@
+.DS_Store
+.local/
+.venv/
+__pycache__/
+*.pyc
+input_docx/
+outputs/
+
