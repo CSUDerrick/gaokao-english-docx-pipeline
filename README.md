@@ -8,16 +8,26 @@
 4. 可选：调用 DeepSeek/OpenAI 兼容 API 自动分析
 5. 输出 JSONL、CSV 和最终横向筛选提示词
 
-## 第一阶段新流水线：segment -> score -> select -> assemble
+## 第一阶段新流水线：preflight -> segment -> score -> select -> enrich -> assemble
 
-推荐先用这个新流程。它把任务拆成四步，便于审核，也能减少后续 token：
+推荐先用这个新流程。它把任务拆成多步，便于审核，也能减少后续 token：
 
 ```text
-segment  用 deepseek-v4-flash 把整份试卷切成题型 JSON，保存题目和答案
-score    用 deepseek-v4-flash 对每个题目评分，评分结果不包含完整题目
-select   程序只读取评分，本地选出各题型候选
+preflight  本地预检 docx 数量、可识别题目数、预计调用量，不调用 API
+segment    默认本地按高考试卷结构切成题型 JSON，保存题目和答案，不调用 API
+score      用 deepseek-v4-flash 对每个题目做轻量评分，不输出词汇/长难句清单
+select     程序只读取评分，本地选出各题型候选
 review-select  可选：用 deepseek-v4-pro 对本地候选做最终复核
-assemble 从本地 segments 取题目原文，把入选题目组合成 Markdown，答案统一放最后
+enrich-selected  只对最终入选题目补充词汇、语法词形、长难句
+assemble   从本地 segments 取题目原文，把入选题目组合成 Markdown，答案统一放最后
+```
+
+建议先预检，确认本地切割能识别出每份卷子的 9 个题型单元：
+
+```bash
+python3 scripts/gaokao_english_docx_pipeline.py input_docx \
+  --out outputs/gaokao_english \
+  --mode preflight
 ```
 
 一键跑完整第一阶段：
@@ -32,38 +42,51 @@ python3 scripts/gaokao_english_docx_pipeline.py input_docx \
   --client http \
   --review-select \
   --segment-workers 4 \
-  --score-workers 8
+  --score-workers 4 \
+  --enrich-workers 2 \
+  --max-retries 8
 ```
 
 默认分工：
 
 ```text
-segment_model = deepseek-v4-flash
-score_model   = deepseek-v4-flash
+segment_input = local，本地切割，不调用 API
+score_model   = deepseek-v4-flash，只做轻量评分
 select        = 本地程序按评分取候选，不再输入完整题目
 review_model  = deepseek-v4-pro，仅输入评分摘要，不输入完整题目
+enrich_model  = deepseek-v4-flash，只处理最终入选题
 assemble      = 本地程序组合题目和答案，不再调用模型
 ```
 
-为了降低成本，`segment` 和 `score` 默认关闭 thinking；`review-select` 默认开启 thinking medium：
+为了降低成本，`segment` 和 `score` 默认显式关闭 thinking；`review-select` 默认开启 thinking medium：
 
 ```text
-segment_thinking = omit
-score_thinking   = omit
+segment_thinking = disabled
+score_thinking   = disabled
 review_thinking  = enabled
+enrich_thinking  = disabled
 review_reasoning_effort = medium
 ```
 
-`segment` 默认会先做本地粗切，再把粗切单元交给 flash：
+注意：`omit` 不是“关闭 thinking”，它表示不传这个参数，服务端可能使用默认 thinking。若要控成本，优先使用 `disabled`。
+
+`segment` 默认本地切割：
 
 ```text
-segment_input = rough
+segment_input = local
 ```
 
-这样比整份试卷直接输入模型更省 token。为了让模型仍能匹配答案，脚本会把试卷末尾识别到的答案区附到每个粗切单元后面。若某份试卷切割质量不好，可以改回整卷输入：
+这样不会产生切割阶段 API token。若某份试卷本地切割质量不好，可以切到 `rough` 或 `full`，再让模型切割：
 
 ```bash
+--segment-input rough
 --segment-input full
+```
+
+遇到 `429 Too Many Requests` 时，程序会自动等待并重试。仍频繁 429 时，先降低：
+
+```bash
+--score-workers 2 --enrich-workers 1 --max-retries 12
 ```
 
 如果你想分步审核，按这个顺序跑：
@@ -83,7 +106,7 @@ python3 scripts/gaokao_english_docx_pipeline.py input_docx \
   --out outputs/gaokao_english \
   --mode score \
   --client http \
-  --score-workers 8
+  --score-workers 4
 
 # 审核 outputs/gaokao_english/score_index.csv
 
@@ -102,7 +125,14 @@ python3 scripts/gaokao_english_docx_pipeline.py input_docx \
 
 # 审核 outputs/gaokao_english/review_select_notes.json 和 selected_items.csv
 
-# 4. 本地组合最终 Markdown，答案统一放最后
+# 4. 只对最终入选题补充词汇、语法词形和长难句
+python3 scripts/gaokao_english_docx_pipeline.py input_docx \
+  --out outputs/gaokao_english \
+  --mode enrich-selected \
+  --client http \
+  --enrich-workers 2
+
+# 5. 本地组合最终 Markdown，答案统一放最后
 python3 scripts/gaokao_english_docx_pipeline.py input_docx \
   --out outputs/gaokao_english \
   --mode assemble
@@ -118,6 +148,7 @@ outputs/gaokao_english/scores/                           每个题目的评分 J
 outputs/gaokao_english/score_index.csv                   评分审核表
 outputs/gaokao_english/selected_items.csv                入选题目清单
 outputs/gaokao_english/review_select_notes.json          pro 复核选择理由（如果运行 review-select）
+outputs/gaokao_english/enrichments/                      最终入选题的词汇/语法/长难句补充 JSON
 outputs/gaokao_english/assembled/final_selected_questions_with_answers.md
 outputs/gaokao_english/assembled/final_teacher_notes.md
 outputs/gaokao_english/assembled/final_answers_only.md
