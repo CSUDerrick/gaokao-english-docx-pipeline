@@ -23,6 +23,7 @@ import concurrent.futures
 import csv
 import json
 import os
+import random
 import re
 import shutil
 import sys
@@ -110,6 +111,7 @@ SELECTION_TARGETS = {
 SEGMENT_PROMPT_VERSION = "segment_v1"
 SCORE_PROMPT_VERSION = "score_v1"
 REVIEW_SELECT_PROMPT_VERSION = "review_select_v1"
+ENRICH_PROMPT_VERSION = "enrich_selected_v1"
 
 
 @dataclass
@@ -153,6 +155,12 @@ def file_size_label(path: Path) -> str:
     if size < 1024 * 1024:
         return f"{size / 1024:.1f} KB"
     return f"{size / (1024 * 1024):.1f} MB"
+
+
+def rough_token_estimate(text: str) -> int:
+    """Cheap mixed Chinese/English token estimate for preflight cost checks."""
+
+    return max(1, len(text) // 3)
 
 
 def preview_text(text: str, max_chars: int) -> str:
@@ -432,11 +440,181 @@ def segment_body(segment: dict) -> str:
 
 
 def extract_answer_tail(text: str, max_chars: int = 8000) -> str:
-    matches = list(re.finditer(r"(?im)(参考答案|答案解析|试题答案|英语答案|答案)", text))
+    matches = list(re.finditer(r"(?im)^\s*(?:英语)?(?:参考答案|答案解析|试题答案|英语答案|答案)\s*[:：]?\s*$", text))
     if not matches:
         return ""
     start = matches[-1].start()
     return text[start : start + max_chars].strip()
+
+
+def trim_answer_tail_from_text(text: str) -> str:
+    matches = list(re.finditer(r"(?im)^\s*(?:英语)?(?:参考答案|答案解析|试题答案|英语答案|答案)\s*[:：]?\s*$", text))
+    if not matches:
+        return text
+    return text[: matches[-1].start()].strip()
+
+
+def line_spans(text: str) -> list[tuple[int, int, str]]:
+    spans: list[tuple[int, int, str]] = []
+    pos = 0
+    for line in text.splitlines(keepends=True):
+        start = pos
+        end = pos + len(line)
+        spans.append((start, end, line.strip()))
+        pos = end
+    return spans
+
+
+def find_line_index(lines: list[tuple[int, int, str]], pattern: str, start: int = 0) -> int | None:
+    regex = re.compile(pattern, re.I)
+    for idx in range(start, len(lines)):
+        if regex.search(lines[idx][2]):
+            return idx
+    return None
+
+
+def find_standalone_letter(lines: list[tuple[int, int, str]], letter: str, start: int = 0) -> int | None:
+    regex = re.compile(rf"^\s*{re.escape(letter)}\s*$", re.I)
+    for idx in range(start, len(lines)):
+        if regex.match(lines[idx][2]):
+            return idx
+    return None
+
+
+def parse_answer_tokens(answer_tail: str) -> dict[int, str]:
+    answers: dict[int, str] = {}
+    for match in re.finditer(r"(\d+)\s*[-—]\s*(\d+)\s+([A-D]+)", answer_tail):
+        start, end, letters = int(match.group(1)), int(match.group(2)), match.group(3).strip()
+        for offset, number in enumerate(range(start, end + 1)):
+            if offset < len(letters):
+                answers[number] = letters[offset]
+    for match in re.finditer(r"(\d+)\s*[.．]\s*([A-D])\b", answer_tail):
+        answers[int(match.group(1))] = match.group(2)
+    return answers
+
+
+def answer_range(answer_tail: str, start: int, end: int) -> list[dict]:
+    parsed = parse_answer_tokens(answer_tail)
+    return [{"number": str(number), "answer": parsed[number]} for number in range(start, end + 1) if number in parsed]
+
+
+def grammar_answer_range(answer_tail: str) -> list[dict]:
+    answers: list[dict] = []
+    for match in re.finditer(r"(\d{2})\s*[.．]\s*([^。\n\r]+?)(?=\s+\d{2}\s*[.．]|$)", answer_tail):
+        number = int(match.group(1))
+        if 56 <= number <= 65:
+            answers.append({"number": str(number), "answer": match.group(2).strip()})
+    return answers
+
+
+def writing_answer_text(answer_tail: str, continuation: bool) -> str:
+    if not answer_tail:
+        return ""
+    if continuation:
+        idx = answer_tail.find("第二节")
+        return answer_tail[idx:].strip() if idx >= 0 else ""
+    idx = answer_tail.find("第一节")
+    if idx < 0:
+        return ""
+    end = answer_tail.find("第二节", idx + 1)
+    return answer_tail[idx:end].strip() if end >= 0 else answer_tail[idx:].strip()
+
+
+def make_local_segment(
+    source_doc: str,
+    section: str,
+    item_label: str,
+    question_text: str,
+    answer_key: list[dict] | str,
+    answer_source: str,
+) -> dict:
+    return {
+        "source_doc": source_doc,
+        "section": section,
+        "display_section": section_display(section),
+        "item_label": item_label,
+        "title": "",
+        "question_text": question_text.strip(),
+        "questions": [],
+        "answer_key": answer_key,
+        "answer_source": answer_source,
+        "confidence": 0.88 if question_text.strip() else 0.0,
+        "prompt_version": "local_segment_v1",
+    }
+
+
+def local_segment_paper(source_doc: str, text: str) -> list[dict]:
+    body = trim_answer_tail_from_text(text)
+    answer_tail = extract_answer_tail(text, max_chars=30000)
+    lines = line_spans(body)
+    starts: list[tuple[int, str, str]] = []
+
+    read_start = find_line_index(lines, r"阅读理解|阅读下列短文|第二部分\s*阅读")
+    search_from = read_start or 0
+    a = find_standalone_letter(lines, "A", search_from)
+    b = find_standalone_letter(lines, "B", (a or search_from) + 1)
+    c = find_standalone_letter(lines, "C", (b or search_from) + 1)
+    d = find_standalone_letter(lines, "D", (c or search_from) + 1)
+    for idx, section, label in [(a, "reading_a", "阅读A"), (b, "reading_b", "阅读B"), (c, "reading_c", "阅读C"), (d, "reading_d", "阅读D")]:
+        if idx is not None:
+            starts.append((lines[idx][0], section, label))
+
+    def add_start(section: str, label: str, idx: int | None) -> int | None:
+        if idx is not None:
+            starts.append((lines[idx][0], section, label))
+        return idx
+
+    gap_idx = add_start("gap_filling", "七选五", find_line_index(lines, r"七选五|选项中有两项为多余选项"))
+    cloze_idx = find_line_index(lines, r"完形填空|完型填空", (gap_idx or 0) + 1)
+    if cloze_idx is None:
+        cloze_idx = find_line_index(lines, r"第一节.*共\s*15\s*小题.*每小题\s*1\s*分", (gap_idx or 0) + 1)
+    cloze_idx = add_start("cloze", "完形填空", cloze_idx)
+    grammar_idx = find_line_index(lines, r"语法填空|在空白处填入\s*1\s*个适当的单词", (cloze_idx or gap_idx or 0) + 1)
+    if grammar_idx is None:
+        grammar_idx = find_line_index(lines, r"第二节.*共\s*10\s*小题.*每小题\s*1\.?5\s*分", (cloze_idx or gap_idx or 0) + 1)
+    grammar_idx = add_start("grammar", "语法填空", grammar_idx)
+    writing_idx = find_line_index(lines, r"第四部分\s*写作|写作[（(]共两节")
+    practical_idx = find_line_index(lines, r"应用文写作|第一节\s*应用文|第一节\s*写作", writing_idx or 0)
+    if practical_idx is None and writing_idx is not None:
+        practical_idx = find_line_index(lines, r"第一节.*满分\s*15\s*分", writing_idx)
+    practical_idx = add_start("practical_writing", "应用文", practical_idx)
+    continuation_idx = find_line_index(lines, r"读后续写|第二节\s*读后续写", (practical_idx or writing_idx or 0) + 1)
+    if continuation_idx is None and writing_idx is not None:
+        continuation_idx = find_line_index(lines, r"第二节.*满分\s*25\s*分", (practical_idx or writing_idx) + 1)
+    add_start("continuation_writing", "读后续写", continuation_idx)
+
+    starts = sorted({(pos, section): (pos, section, label) for pos, section, label in starts}.values(), key=lambda x: x[0])
+    segments: list[dict] = []
+    answer_ranges = {
+        "reading_a": (21, 23),
+        "reading_b": (24, 27),
+        "reading_c": (28, 31),
+        "reading_d": (32, 35),
+        "gap_filling": (36, 40),
+        "cloze": (41, 55),
+    }
+    for i, (pos, section, label) in enumerate(starts):
+        end = starts[i + 1][0] if i + 1 < len(starts) else len(body)
+        qtext = body[pos:end].strip()
+        if len(qtext) < 80:
+            continue
+        if section in answer_ranges:
+            ak = answer_range(answer_tail, *answer_ranges[section])
+            answer_source = "答案区" if ak else "未识别"
+        elif section == "grammar":
+            ak = grammar_answer_range(answer_tail)
+            answer_source = "答案区" if ak else "未识别"
+        elif section == "practical_writing":
+            ak = writing_answer_text(answer_tail, continuation=False)
+            answer_source = "答案区/范文" if ak else "未识别"
+        elif section == "continuation_writing":
+            ak = writing_answer_text(answer_tail, continuation=True)
+            answer_source = "答案区/范文" if ak else "未识别"
+        else:
+            ak = []
+            answer_source = "未识别"
+        segments.append(make_local_segment(source_doc, section, label, qtext, ak, answer_source))
+    return segments
 
 
 def read_prompt_template(path: Path) -> str:
@@ -594,6 +772,7 @@ def call_chat_completion(
     reasoning_effort: str,
     thinking: str,
     timeout: int,
+    max_tokens: int | None = None,
     max_retries: int = 3,
 ) -> ChatResult:
     if client_mode in {"auto", "sdk"}:
@@ -607,6 +786,7 @@ def call_chat_completion(
                 reasoning_effort=reasoning_effort,
                 thinking=thinking,
                 timeout=timeout,
+                max_tokens=max_tokens,
                 max_retries=max_retries,
             )
         except ImportError:
@@ -625,6 +805,7 @@ def call_chat_completion(
         reasoning_effort=reasoning_effort,
         thinking=thinking,
         timeout=timeout,
+        max_tokens=max_tokens,
         max_retries=max_retries,
     )
 
@@ -636,6 +817,7 @@ def chat_payload(
     temperature: float,
     reasoning_effort: str,
     thinking: str,
+    max_tokens: int | None = None,
 ) -> dict:
     payload = {
         "model": model,
@@ -650,7 +832,53 @@ def chat_payload(
         payload["reasoning_effort"] = reasoning_effort
     if thinking != "omit":
         payload["thinking"] = {"type": thinking}
+    if max_tokens:
+        payload["max_tokens"] = max_tokens
     return payload
+
+
+def is_retryable_status(status_code: int | None) -> bool:
+    if status_code is None:
+        return True
+    return status_code in {408, 409, 425, 429} or status_code >= 500
+
+
+def retry_after_seconds(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        seconds = float(str(value).strip())
+    except ValueError:
+        return None
+    return seconds if seconds >= 0 else None
+
+
+def retry_delay_seconds(attempt: int, retry_after: object = None) -> float:
+    explicit = retry_after_seconds(retry_after)
+    if explicit is not None:
+        return min(explicit, 90.0)
+    base = min(2 ** max(0, attempt - 1), 60)
+    return base + random.uniform(0.2, 1.2)
+
+
+def exception_status_code(exc: Exception) -> int | None:
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        return status
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    return status if isinstance(status, int) else None
+
+
+def exception_retry_after(exc: Exception) -> object:
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    try:
+        return headers.get("retry-after") or headers.get("Retry-After")
+    except AttributeError:
+        return None
 
 
 def call_chat_completion_sdk(
@@ -663,6 +891,7 @@ def call_chat_completion_sdk(
     reasoning_effort: str,
     thinking: str,
     timeout: int,
+    max_tokens: int | None,
     max_retries: int,
 ) -> ChatResult:
     # DEEPSEEK TUNING:
@@ -678,6 +907,7 @@ def call_chat_completion_sdk(
         temperature=temperature,
         reasoning_effort=reasoning_effort,
         thinking="omit",
+        max_tokens=max_tokens,
     )
     if thinking != "omit":
         # The OpenAI SDK forwards DeepSeek-specific fields through extra_body.
@@ -697,7 +927,11 @@ def call_chat_completion_sdk(
             )
         except Exception as exc:
             last_error = exc
-            time.sleep(min(2 * attempt, 8))
+            status_code = exception_status_code(exc)
+            if not is_retryable_status(status_code):
+                break
+            if attempt < max_retries:
+                time.sleep(retry_delay_seconds(attempt, exception_retry_after(exc)))
     raise RuntimeError(f"SDK API call failed after {max_retries} attempts: {last_error}")
 
 
@@ -718,6 +952,7 @@ def call_chat_completion_http(
     reasoning_effort: str,
     thinking: str,
     timeout: int,
+    max_tokens: int | None,
     max_retries: int = 3,
 ) -> ChatResult:
     # HTTP fallback mirrors the official curl example. It accepts either the API
@@ -728,6 +963,7 @@ def call_chat_completion_http(
         temperature=temperature,
         reasoning_effort=reasoning_effort,
         thinking=thinking,
+        max_tokens=max_tokens,
     )
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     headers = {
@@ -755,12 +991,14 @@ def call_chat_completion_http(
             except Exception:
                 error_body = ""
             last_error = f"HTTP {exc.code} {exc.reason}: {error_body or '<empty response body>'}"
-            if 400 <= exc.code < 500:
+            if not is_retryable_status(exc.code):
                 break
-            time.sleep(min(2 * attempt, 8))
+            if attempt < max_retries:
+                time.sleep(retry_delay_seconds(attempt, exc.headers.get("Retry-After")))
         except (urllib.error.URLError, KeyError, json.JSONDecodeError) as exc:
             last_error = exc
-            time.sleep(min(2 * attempt, 8))
+            if attempt < max_retries:
+                time.sleep(retry_delay_seconds(attempt))
     raise RuntimeError(f"API call failed after {max_retries} attempts: {last_error}")
 
 
@@ -887,9 +1125,9 @@ def build_score_prompt(segment: dict) -> str:
     return f"""任务版本：{SCORE_PROMPT_VERSION}
 
 你是一名熟悉高三英语备考、模拟题命题趋势和高考英语阅读难度分析的教研老师。
-请对一个已经切割好的题目单元做“质量评分与教学价值标注”。
+请对一个已经切割好的题目单元做“轻量质量评分”。这是第一轮大批量筛选，请保持输出简短。
 
-请严格输出 JSON，不要输出 Markdown，不要添加解释性前后缀。不要在输出中复述完整题目原文。
+请严格输出 JSON，不要输出 Markdown，不要添加解释性前后缀。不要在输出中复述完整题目原文，不要输出词汇表、长难句清单或详细语法讲解。
 
 JSON 顶层结构：
 {{
@@ -907,30 +1145,12 @@ JSON 顶层结构：
   "writing_angle_novelty_score": 1,
   "recommendation_score": 1,
   "suitable_for_intensive_teaching": "适合/一般/不太适合",
-  "core_high_frequency_words": [
-    {{"word": "英文词汇", "meaning": "中文释义", "context_meaning": "文中语境含义", "teaching_reason": "适合讲解的原因"}}
-  ],
-  "familiar_words_new_meanings": [
-    {{"word": "英文词汇", "meaning": "中文释义", "context_meaning": "文中语境含义", "teaching_reason": "适合讲解的原因"}}
-  ],
-  "difficult_or_low_frequency_words": [
-    {{"word": "英文词汇", "meaning": "中文释义", "context_meaning": "文中语境含义", "teaching_reason": "适合讲解的原因"}}
-  ],
-  "topic_words": [
-    {{"word": "英文词汇", "meaning": "中文释义", "context_meaning": "文中语境含义", "teaching_reason": "适合讲解的原因"}}
-  ],
-  "word_formation_and_grammar": [
-    {{"type": "词性转换/派生词/非谓语/从句/长难句/其他", "evidence": "原句或关键词", "teaching_point": "考点说明"}}
-  ],
-  "long_difficult_sentences": [
-    {{"sentence": "原句", "structure_analysis": "结构分析", "teaching_point": "讲解价值"}}
-  ],
-  "exam_skills": ["可能考查的能力"],
-  "main_difficulty_sources": ["词汇/长难句/抽象话题/逻辑关系/选项干扰"],
+  "exam_skills": ["最多3个能力标签"],
+  "main_difficulty_sources": ["最多3个难度来源"],
   "best_fit_selection_bucket": "新题材/高难度/题型新/写作角度新/不优先选择",
-  "selection_reason": "后续筛选是否值得入选及原因",
-  "classroom_suggestion": "精讲/限时训练/课后拓展/拔高训练，以及简要理由",
-  "score_summary": "一句话概括本题价值"
+  "selection_reason": "不超过80字，说明后续筛选是否值得入选",
+  "classroom_suggestion": "不超过50字，建议精讲/限时训练/课后拓展/拔高训练",
+  "score_summary": "不超过50字，一句话概括本题价值"
 }}
 
 评分说明：
@@ -977,6 +1197,50 @@ JSON 顶层结构：
 
 候选材料只包含评分摘要，不包含完整题目，以节省 token：
 {json.dumps(candidates, ensure_ascii=False)}
+"""
+
+
+def build_enrich_prompt(segment: dict, score: dict) -> str:
+    return f"""任务版本：{ENRICH_PROMPT_VERSION}
+
+你是一名高三英语教研老师。请只对“最终入选”的题目补充详细讲解材料。
+请严格输出 JSON，不要输出 Markdown，不要添加解释性前后缀。
+
+JSON 顶层结构：
+{{
+  "item_id": "题目ID",
+  "core_high_frequency_words": [
+    {{"word": "英文词汇", "meaning": "中文释义", "context_meaning": "文中语境含义", "teaching_reason": "适合讲解的原因"}}
+  ],
+  "familiar_words_new_meanings": [
+    {{"word": "英文词汇", "meaning": "中文释义", "context_meaning": "文中语境含义", "teaching_reason": "适合讲解的原因"}}
+  ],
+  "difficult_or_low_frequency_words": [
+    {{"word": "英文词汇", "meaning": "中文释义", "context_meaning": "文中语境含义", "teaching_reason": "适合讲解的原因"}}
+  ],
+  "topic_words": [
+    {{"word": "英文词汇", "meaning": "中文释义", "context_meaning": "文中语境含义", "teaching_reason": "适合讲解的原因"}}
+  ],
+  "word_formation_and_grammar": [
+    {{"type": "词性转换/派生词/非谓语/从句/长难句/其他", "evidence": "原句或关键词", "teaching_point": "考点说明"}}
+  ],
+  "long_difficult_sentences": [
+    {{"sentence": "原句", "structure_analysis": "结构分析", "teaching_point": "讲解价值"}}
+  ],
+  "teaching_notes": "不超过150字的课堂讲解建议"
+}}
+
+数量要求：
+- 每类词汇最多8项。
+- 语法/词形变化最多8项。
+- 长难句最多3句。
+- 不要重复题目原文，只引用必要短句。
+
+评分摘要：
+{json.dumps(score, ensure_ascii=False)}
+
+题目单元 JSON：
+{json.dumps(segment, ensure_ascii=False)}
 """
 
 
@@ -1042,6 +1306,7 @@ def call_stage_model(
     model: str,
     reasoning_effort: str,
     thinking: str,
+    max_tokens: int | None = None,
 ) -> ChatResult:
     return call_chat_completion(
         prompt,
@@ -1053,6 +1318,8 @@ def call_stage_model(
         reasoning_effort=reasoning_effort,
         thinking=thinking,
         timeout=args.timeout,
+        max_tokens=max_tokens,
+        max_retries=args.max_retries,
     )
 
 
@@ -1131,6 +1398,47 @@ def segment_docx_file(docx: Path, args: argparse.Namespace, out_dir: Path) -> li
     text_path = extracted_dir / f"{safe_stem(source_doc)}.txt"
     text_path.write_text(text, encoding="utf-8")
 
+    if args.segment_input == "local":
+        segments = local_segment_paper(source_doc, text)
+        write_json(rough_dir / f"{safe_stem(source_doc)}__local_segments.json", segments)
+        counters: dict[str, int] = {}
+        rows: list[dict] = []
+        for segment in segments:
+            section_key = normalize_section(str(segment.get("section") or segment.get("display_section") or "unknown"))
+            counters[section_key] = counters.get(section_key, 0) + 1
+            item_id = f"{safe_stem(source_doc)}__{section_key}__{counters[section_key]:02d}"
+            item_label = str(segment.get("item_label") or f"{section_display(section_key)}{counters[section_key]}")
+            segment.update(
+                {
+                    "item_id": item_id,
+                    "source_doc": source_doc,
+                    "section": section_key,
+                    "display_section": section_display(section_key),
+                    "item_label": item_label,
+                    "rough_unit": "local",
+                    "rough_unit_index": 0,
+                    "prompt_version": "local_segment_v1",
+                }
+            )
+            segment_path = segments_dir / f"{safe_filename(item_id)}.json"
+            write_json(segment_path, segment)
+            rows.append(
+                {
+                    "item_id": item_id,
+                    "source_doc": source_doc,
+                    "section": section_key,
+                    "display_section": section_display(section_key),
+                    "item_label": item_label,
+                    "title": segment.get("title", ""),
+                    "char_count": len(segment_body(segment)),
+                    "answer_count": len(segment.get("answer_key") or []),
+                    "confidence": segment.get("confidence", ""),
+                    "rough_unit": "local",
+                    "segment_path": str(segment_path),
+                }
+            )
+        return rows
+
     units = rough_segment_units(source_doc, text, args)
     write_json(rough_dir / f"{safe_stem(source_doc)}__rough_units.json", units)
 
@@ -1145,6 +1453,7 @@ def segment_docx_file(docx: Path, args: argparse.Namespace, out_dir: Path) -> li
             model=args.segment_model,
             reasoning_effort=args.segment_reasoning_effort,
             thinking=args.segment_thinking,
+            max_tokens=args.segment_max_tokens,
         )
         save_api_conversation(out_dir, "segment", unit["unit_id"], prompt, chat_result, args)
 
@@ -1199,14 +1508,17 @@ def run_segment(args: argparse.Namespace) -> list[dict]:
     out_dir = Path(args.out)
     ensure_dir(out_dir)
     api_key = args.api_key or os.environ.get(args.api_key_env)
-    if not api_key:
+    if args.segment_input != "local" and not api_key:
         raise SystemExit(f"Missing API key. Set {args.api_key_env} or pass --api-key.")
 
     docx_files = collect_docx(Path(args.input))
     if not docx_files:
         raise SystemExit(f"No .docx files found under {args.input}")
 
-    log(args, f"Segmenting {len(docx_files)} docx file(s) with {args.segment_model}; workers={args.segment_workers}.")
+    if args.segment_input == "local":
+        log(args, f"Segmenting {len(docx_files)} docx file(s) locally; no segment API calls will be made.")
+    else:
+        log(args, f"Segmenting {len(docx_files)} docx file(s) with {args.segment_model}; workers={args.segment_workers}.")
     rows: list[dict] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.segment_workers)) as executor:
         future_map = {executor.submit(segment_docx_file, docx, args, out_dir): docx for docx in docx_files}
@@ -1261,6 +1573,7 @@ def score_one_segment(row: dict, args: argparse.Namespace, out_dir: Path) -> dic
         model=args.score_model,
         reasoning_effort=args.score_reasoning_effort,
         thinking=args.score_thinking,
+        max_tokens=args.score_max_tokens,
     )
     save_api_conversation(out_dir, "score", item_id, prompt, chat_result, args)
     parsed = parse_model_json(chat_result.content)
@@ -1469,6 +1782,7 @@ def run_review_select(args: argparse.Namespace) -> list[dict]:
                 model=args.review_model,
                 reasoning_effort=args.review_reasoning_effort,
                 thinking=args.review_thinking,
+                max_tokens=args.review_max_tokens,
             )
             save_api_conversation(out_dir, "review_select", section, prompt, chat_result, args)
             parsed = parse_model_json(chat_result.content)
@@ -1529,6 +1843,86 @@ def run_review_select(args: argparse.Namespace) -> list[dict]:
     return final_selected
 
 
+def enrich_one_selected(row: dict, args: argparse.Namespace, out_dir: Path) -> dict:
+    enrich_dir = out_dir / "enrichments"
+    ensure_dir(enrich_dir)
+    item_id = row["item_id"]
+    enrich_path = enrich_dir / f"{safe_filename(item_id)}.json"
+    if enrich_path.exists() and not args.force:
+        existing = read_json(enrich_path)
+        if isinstance(existing, dict):
+            row["enrichment"] = existing.get("enrichment", existing)
+            row["enrichment_path"] = str(enrich_path)
+            return row
+
+    segment = read_json(Path(row["segment_path"]))
+    if not isinstance(segment, dict):
+        raise RuntimeError(f"Invalid segment file for {item_id}")
+    score = row.get("score", {}) if isinstance(row.get("score"), dict) else {}
+    prompt = build_enrich_prompt(segment, score)
+    chat_result = call_stage_model(
+        args,
+        prompt,
+        model=args.enrich_model,
+        reasoning_effort=args.enrich_reasoning_effort,
+        thinking=args.enrich_thinking,
+        max_tokens=args.enrich_max_tokens,
+    )
+    save_api_conversation(out_dir, "enrich", item_id, prompt, chat_result, args)
+    parsed = parse_model_json(chat_result.content)
+    enrichment = parsed if isinstance(parsed, dict) else {"raw_enrichment": str(parsed)}
+    enrichment.setdefault("item_id", item_id)
+    result = {
+        "item_id": item_id,
+        "source_doc": row.get("source_doc", ""),
+        "section": row.get("section", ""),
+        "display_section": row.get("display_section", ""),
+        "item_label": row.get("item_label", ""),
+        "enrichment": enrichment,
+        "usage": chat_result.usage,
+        "client_used": chat_result.client_used,
+        "prompt_version": ENRICH_PROMPT_VERSION,
+    }
+    write_json(enrich_path, result)
+    row["enrichment"] = enrichment
+    row["enrichment_path"] = str(enrich_path)
+    return row
+
+
+def run_enrich_selected(args: argparse.Namespace) -> list[dict]:
+    out_dir = Path(args.out)
+    api_key = args.api_key or os.environ.get(args.api_key_env)
+    if not api_key:
+        raise SystemExit(f"Missing API key. Set {args.api_key_env} or pass --api-key.")
+    selection_path = out_dir / "selected_items.json"
+    if not selection_path.exists():
+        raise SystemExit(f"Missing {selection_path}. Run --mode select first.")
+    selected = read_json(selection_path)
+    if not isinstance(selected, list):
+        raise SystemExit(f"Invalid {selection_path}")
+
+    log(args, f"Enriching {len(selected)} selected item(s) with {args.enrich_model}; workers={args.enrich_workers}.")
+    results: list[dict] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.enrich_workers)) as executor:
+        future_map = {executor.submit(enrich_one_selected, row, args, out_dir): row for row in selected}
+        for future in concurrent.futures.as_completed(future_map):
+            row = future_map[future]
+            try:
+                result = future.result()
+                results.append(result)
+                log(args, f"  enriched {row['item_id']} ({len(results)}/{len(selected)})")
+            except Exception as exc:
+                log(args, f"  enrich failed for {row['item_id']}: {exc}")
+                raise
+
+    results.sort(key=lambda r: (section_order(r.get("section", "")), r.get("source_doc", ""), r.get("item_id", "")))
+    enriched_path = out_dir / "selected_items.enriched.json"
+    write_json(enriched_path, results)
+    write_json(selection_path, results)
+    log(args, f"Enrichment outputs written: {enriched_path} ({file_size_label(enriched_path)})")
+    return results
+
+
 def md_escape_heading(text: str) -> str:
     return str(text or "").replace("\n", " ").strip()
 
@@ -1559,6 +1953,19 @@ def render_grammar(points: object) -> str:
     return "\n".join(parts) or "暂无"
 
 
+def render_sentences(points: object) -> str:
+    if not isinstance(points, list) or not points:
+        return "暂无"
+    parts: list[str] = []
+    for item in points[:5]:
+        if isinstance(item, dict):
+            sentence = item.get("sentence", "")
+            analysis = item.get("structure_analysis", "")
+            teaching = item.get("teaching_point", "")
+            parts.append(f"- {sentence}\n  结构：{analysis}\n  讲解：{teaching}".strip())
+    return "\n".join(parts) or "暂无"
+
+
 def run_assemble(args: argparse.Namespace) -> None:
     out_dir = Path(args.out)
     selection_path = out_dir / "selected_items.json"
@@ -1579,6 +1986,8 @@ def run_assemble(args: argparse.Namespace) -> None:
     for row in ordered:
         segment = read_json(Path(row["segment_path"]))
         score = row.get("score", {}) if isinstance(row.get("score"), dict) else {}
+        enrichment = row.get("enrichment", {}) if isinstance(row.get("enrichment"), dict) else {}
+        score = score | enrichment
         section_name = row.get("display_section") or section_display(row.get("section", ""))
         if section_name != current_section:
             question_lines.extend(["", f"### {section_name}"])
@@ -1624,6 +2033,11 @@ def run_assemble(args: argparse.Namespace) -> None:
                 "",
                 "语法与词汇变形：",
                 render_grammar(score.get("word_formation_and_grammar", [])),
+                "",
+                "长难句：",
+                render_sentences(score.get("long_difficult_sentences", [])),
+                "",
+                f"补充讲解建议：{score.get('teaching_notes', '')}",
             ]
         )
 
@@ -1638,12 +2052,62 @@ def run_assemble(args: argparse.Namespace) -> None:
     log(args, f"Assembled answers only: {answers_path} ({file_size_label(answers_path)})")
 
 
+def run_preflight(args: argparse.Namespace) -> None:
+    input_path = Path(args.input)
+    out_dir = Path(args.out)
+    docx_files = collect_docx(input_path)
+    if not docx_files:
+        raise SystemExit(f"No .docx files found under {args.input}")
+
+    total_chars = 0
+    local_segment_count = 0
+    local_segment_chars = 0
+    low_confidence_docs: list[str] = []
+    for docx in docx_files:
+        text = extract_docx_text(docx)
+        total_chars += len(text)
+        if args.segment_input == "local":
+            segments = local_segment_paper(docx.name, text)
+            local_segment_count += len(segments)
+            local_segment_chars += sum(len(segment_body(segment)) for segment in segments)
+            if len(segments) < 7:
+                low_confidence_docs.append(f"{docx.name}（本地只识别到 {len(segments)} 个单元）")
+
+    api_segment_calls = 0 if args.segment_input == "local" else len(docx_files)
+    score_calls = local_segment_count if args.segment_input == "local" else "取决于 segment 输出"
+    approx_score_prompt_tokens = rough_token_estimate("x" * local_segment_chars) if args.segment_input == "local" else "取决于 segment 输出"
+    existing_conversations = len(list((out_dir / "api_conversations").rglob("*.md"))) if (out_dir / "api_conversations").exists() else 0
+    current_docs = {docx.name for docx in docx_files}
+    stale_extracted = []
+    extracted_dir = out_dir / "extracted_text"
+    if extracted_dir.exists():
+        for path in extracted_dir.glob("*.txt"):
+            if not any(safe_stem(name) == path.stem for name in current_docs):
+                stale_extracted.append(path.name)
+
+    log(args, "Preflight summary:")
+    log(args, f"  input docx: {len(docx_files)}")
+    log(args, f"  extracted text chars: {total_chars:,} (roughly {rough_token_estimate('x' * total_chars):,} tokens if sent once)")
+    log(args, f"  segment mode: {args.segment_input}; expected segment API calls: {api_segment_calls}")
+    if args.segment_input == "local":
+        log(args, f"  local segments: {local_segment_count}; score API calls after segment: {score_calls}")
+        log(args, f"  rough score prompt text tokens before system overhead: {approx_score_prompt_tokens:,}")
+    log(args, f"  existing saved API conversations under output: {existing_conversations}")
+    if stale_extracted:
+        log(args, f"  stale output warning: {len(stale_extracted)} extracted text file(s) do not match current input; use --init before a fresh run.")
+    if low_confidence_docs:
+        log(args, "  local segmentation warning:")
+        for item in low_confidence_docs:
+            log(args, f"    - {item}")
+
+
 def run_stage1(args: argparse.Namespace) -> None:
     run_segment(args)
     run_score(args)
     run_select(args)
     if args.review_select:
         run_review_select(args)
+    run_enrich_selected(args)
     run_assemble(args)
 
 
@@ -1764,6 +2228,8 @@ def run_analyze(args: argparse.Namespace) -> None:
             reasoning_effort=args.reasoning_effort,
             thinking=args.thinking,
             timeout=args.timeout,
+            max_tokens=args.max_tokens,
+            max_retries=args.max_retries,
         )
         elapsed = time.time() - started
         log(
@@ -1863,6 +2329,8 @@ def run_final(args: argparse.Namespace) -> None:
         reasoning_effort=args.reasoning_effort,
         thinking=args.thinking,
         timeout=args.timeout,
+        max_tokens=args.max_tokens,
+        max_retries=args.max_retries,
     )
     elapsed = time.time() - started
     log(
@@ -1887,7 +2355,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--out", default="outputs/gaokao_english", help="Output folder.")
     parser.add_argument(
         "--mode",
-        choices=["prompts", "analyze", "final", "segment", "score", "select", "review-select", "assemble", "stage1"],
+        choices=["prompts", "analyze", "final", "preflight", "segment", "score", "select", "review-select", "enrich-selected", "assemble", "stage1"],
         default="prompts",
     )
     parser.add_argument("--prompt-template", default="config/analysis_prompt_template.md")
@@ -1899,17 +2367,21 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--segment-model", default="deepseek-v4-flash", help="Model used to split full papers into section JSON files.")
     parser.add_argument("--score-model", default="deepseek-v4-flash", help="Model used to score each segmented item.")
     parser.add_argument("--review-model", default="deepseek-v4-pro", help="Model used to review local shortlist selections.")
+    parser.add_argument("--enrich-model", default="deepseek-v4-flash", help="Model used to enrich final selected items with words/grammar/sentences.")
     parser.add_argument("--segment-workers", type=int, default=4, help="Concurrent docx segmentation requests.")
-    parser.add_argument("--score-workers", type=int, default=8, help="Concurrent scoring requests.")
-    parser.add_argument("--segment-input", choices=["rough", "full"], default="rough", help="Use local rough chunks or full paper text for segmentation.")
+    parser.add_argument("--score-workers", type=int, default=4, help="Concurrent scoring requests.")
+    parser.add_argument("--enrich-workers", type=int, default=2, help="Concurrent enrichment requests for selected items.")
+    parser.add_argument("--segment-input", choices=["local", "rough", "full"], default="local", help="local parses common exam structure without API; rough/full use model segmentation.")
     parser.add_argument("--answer-tail-chars", type=int, default=8000, help="Characters of the final answer area appended to rough segment chunks.")
     parser.add_argument("--review-candidates", type=int, default=6, help="Local shortlist size per section before pro review.")
     parser.add_argument("--segment-reasoning-effort", choices=["none", "low", "medium", "high"], default="none")
     parser.add_argument("--score-reasoning-effort", choices=["none", "low", "medium", "high"], default="none")
     parser.add_argument("--review-reasoning-effort", choices=["none", "low", "medium", "high"], default="medium")
-    parser.add_argument("--segment-thinking", choices=["enabled", "disabled", "omit"], default="omit")
-    parser.add_argument("--score-thinking", choices=["enabled", "disabled", "omit"], default="omit")
+    parser.add_argument("--enrich-reasoning-effort", choices=["none", "low", "medium", "high"], default="none")
+    parser.add_argument("--segment-thinking", choices=["enabled", "disabled", "omit"], default="disabled")
+    parser.add_argument("--score-thinking", choices=["enabled", "disabled", "omit"], default="disabled")
     parser.add_argument("--review-thinking", choices=["enabled", "disabled", "omit"], default="enabled")
+    parser.add_argument("--enrich-thinking", choices=["enabled", "disabled", "omit"], default="disabled")
     parser.add_argument("--api-key-env", default="DEEPSEEK_API_KEY")
     parser.add_argument("--api-key", default="")
     # DEEPSEEK TUNING: `auto` tries the OpenAI SDK first, then falls back to raw HTTP.
@@ -1920,6 +2392,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--thinking", choices=["enabled", "disabled", "omit"], default="enabled")
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--timeout", type=int, default=120)
+    parser.add_argument("--max-retries", type=int, default=8, help="Max retries for retryable API errors such as 429 rate limits.")
+    parser.add_argument("--max-tokens", type=int, default=6000, help="Output token cap for legacy analyze/final modes.")
+    parser.add_argument("--segment-max-tokens", type=int, default=4000, help="Output token cap for AI segmentation. Ignored by local segmentation.")
+    parser.add_argument("--score-max-tokens", type=int, default=1200, help="Output token cap for each lightweight score call.")
+    parser.add_argument("--review-max-tokens", type=int, default=2500, help="Output token cap for each review-select call.")
+    parser.add_argument("--enrich-max-tokens", type=int, default=3500, help="Output token cap for each selected-item enrichment call.")
     parser.add_argument(
         "--show-output",
         choices=["none", "preview", "full"],
@@ -1973,6 +2451,9 @@ def main(argv: list[str]) -> int:
     elif args.mode == "final":
         run_final(args)
         log(args, f"Pipeline finished successfully: wrote final document under {Path(args.out)}")
+    elif args.mode == "preflight":
+        run_preflight(args)
+        log(args, "Pipeline finished successfully: preflight completed.")
     elif args.mode == "segment":
         run_segment(args)
         log(args, f"Pipeline finished successfully: wrote segments under {Path(args.out)}")
@@ -1985,6 +2466,9 @@ def main(argv: list[str]) -> int:
     elif args.mode == "review-select":
         run_review_select(args)
         log(args, f"Pipeline finished successfully: wrote reviewed selections under {Path(args.out)}")
+    elif args.mode == "enrich-selected":
+        run_enrich_selected(args)
+        log(args, f"Pipeline finished successfully: enriched selected items under {Path(args.out)}")
     elif args.mode == "assemble":
         run_assemble(args)
         log(args, f"Pipeline finished successfully: wrote assembled markdown under {Path(args.out)}")
