@@ -28,6 +28,7 @@ import re
 import shutil
 import sys
 import time
+import http.client
 import urllib.error
 import urllib.request
 import zipfile
@@ -45,7 +46,7 @@ SECTION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("reading_b", re.compile(r"(?im)^\s*B\s*$")),
     ("reading_c", re.compile(r"(?im)^\s*C\s*$")),
     ("reading_d", re.compile(r"(?im)^\s*D\s*$")),
-    ("gap_filling", re.compile(r"(?im)七选五|选五|根据短文内容.*选项|选项中有两项为多余选项")),
+    ("gap_filling", re.compile(r"(?im)七选五|选五|根据短文内容.*选项|选项中有两项(?:为)?多余选项")),
     ("cloze", re.compile(r"(?im)完形填空|完型填空|cloze")),
     ("grammar", re.compile(r"(?im)语法填空|短文填空|填入适当的单词|括号内单词的正确形式")),
     ("practical_writing", re.compile(r"(?im)应用文|书面表达|写一封|投稿|通知|邀请信|建议信")),
@@ -412,6 +413,9 @@ def score_number(value: object) -> float:
         return 0.0
 
 
+NO_ANSWER_MARKER = "原卷未提供答案"
+
+
 def answer_key_text(answer_key: object) -> str:
     if not answer_key:
         return "未识别"
@@ -439,19 +443,52 @@ def segment_body(segment: dict) -> str:
     return json.dumps(segment, ensure_ascii=False)
 
 
-def extract_answer_tail(text: str, max_chars: int = 8000) -> str:
+def _find_answer_section_start(text: str) -> int | None:
+    """Return the character position where the answer section begins, or None."""
+    # Stage 1: answer header on its own line (e.g. "英语答案解析")
     matches = list(re.finditer(r"(?im)^\s*(?:英语)?(?:参考答案|答案解析|试题答案|英语答案|答案)\s*[:：]?\s*$", text))
-    if not matches:
+    if matches:
+        return matches[-1].start()
+
+    # Stage 2: answer header at end of a line, not necessarily at line start
+    # (e.g. "...故事结尾 _________________________________ 安徽A10联盟...英语答案解析")
+    matches = list(re.finditer(r"(?im)(?:英语|英语试题)?(?:参考)?答案(?:解析)?\s*[:：]?\s*$", text))
+    if matches:
+        candidate = matches[-1].start()
+        after = text[candidate : candidate + 300]
+        if re.search(r"\d+[-—~]\d+\s*[A-G]|\d+\.[A-G]\b|^\d+\.\s*\w+", after, re.M):
+            return candidate
+
+    # Stage 3: look for answer-range lines (e.g. "21-23 BDC  24-27 CCBA") in
+    # the last 25 % of the document and walk backwards to find the nearest
+    # answer header or line boundary.  We restrict to the tail because some
+    # papers embed answer ranges inside explanations earlier in the text.
+    tail_start = max(0, len(text) - max(1, len(text) // 4))
+    answer_line = re.search(r"(?m)^\s*\d+[-—~]\d+\s*[.．]?\s*[A-G]+", text[tail_start:])
+    if answer_line:
+        answer_line_pos = tail_start + answer_line.start()
+        before = text[:answer_line_pos]
+        header = re.search(r"(?im)(?:英语)?(?:参考答案|答案解析|试题答案|英语答案)[^\n]{0,30}$", before)
+        if header:
+            return header.start()
+        # If no header found, start from the answer line itself.
+        return answer_line_pos
+
+    return None
+
+
+def extract_answer_tail(text: str, max_chars: int = 8000) -> str:
+    start = _find_answer_section_start(text)
+    if start is None:
         return ""
-    start = matches[-1].start()
     return text[start : start + max_chars].strip()
 
 
 def trim_answer_tail_from_text(text: str) -> str:
-    matches = list(re.finditer(r"(?im)^\s*(?:英语)?(?:参考答案|答案解析|试题答案|英语答案|答案)\s*[:：]?\s*$", text))
-    if not matches:
+    start = _find_answer_section_start(text)
+    if start is None:
         return text
-    return text[: matches[-1].start()].strip()
+    return text[:start].strip()
 
 
 def line_spans(text: str) -> list[tuple[int, int, str]]:
@@ -482,14 +519,93 @@ def find_standalone_letter(lines: list[tuple[int, int, str]], letter: str, start
 
 
 def parse_answer_tokens(answer_tail: str) -> dict[int, str]:
+    """Parse answers from a compact answer-key block.
+
+    Handles range separators: ``-``, ``—`` (em-dash), ``~`` (tilde),
+    and ``--`` (double-hyphen, common in some papers).
+    Also handles single-number answers such as ``21. B``.
+    """
     answers: dict[int, str] = {}
-    for match in re.finditer(r"(\d+)\s*[-—]\s*(\d+)\s+([A-D]+)", answer_tail):
+    # Range answers: "21-23 BDC", "21—23. BDB", "21~23DBC", "41--45. DADBA"
+    range_patterns = [
+        re.compile(r"(\d+)\s*[-—]\s*(\d+)\s*[.．]?\s*([A-G]+)"),
+        re.compile(r"(\d+)\s*~\s*(\d+)\s*[.．]?\s*([A-G]+)"),
+        re.compile(r"(\d+)\s*--\s*(\d+)\s*[.．]?\s*([A-G]+)"),
+    ]
+    for pattern in range_patterns:
+        for match in pattern.finditer(answer_tail):
+            start, end, letters = int(match.group(1)), int(match.group(2)), match.group(3).strip()
+            for offset, number in enumerate(range(start, end + 1)):
+                if offset < len(letters) and number not in answers:
+                    answers[number] = letters[offset]
+    # Single-number answers: "21. B" or "21．B"
+    for match in re.finditer(r"(?<!\d)(\d+)\s*[.．]\s*([A-G])\b(?!\s*[.．])", answer_tail):
+        number = int(match.group(1))
+        if number not in answers:
+            answers[number] = match.group(2)
+    return answers
+
+
+def parse_grammar_answers(answer_tail: str) -> dict[int, str]:
+    """Parse grammar-fill answers (questions 56-65).
+
+    Handles both well-spaced (``56. marking 57. shows``) and concatenated
+    formats (``56. would spark57. playfully58.with``).
+    """
+    answers: dict[int, str] = {}
+    # Pre-process: insert a space before each grammar question number so that
+    # concatenated answers like "spark57." become "spark 57."
+    normalized = re.sub(r"(?<!\d)(5[6-9]|6[0-5])\s*\.", r" \1. ", answer_tail)
+    # Now parse: number, dot, then everything until the next number-dot or end
+    for match in re.finditer(
+        r"(5[6-9]|6[0-5])\s*[.．]\s*(.+?)(?=\s*(?:5[6-9]|6[0-5])\s*[.．]|$)",
+        normalized,
+    ):
+        number = int(match.group(1))
+        if number not in answers:
+            answer = match.group(2).strip()
+            # Trim trailing punctuation / stray characters
+            answer = answer.rstrip(".,;，。；、")
+            if answer:
+                answers[number] = answer
+    # Fallback: single-word grammar answers like "56. celebrated"
+    for match in re.finditer(r"(5[6-9]|6[0-5])\s*[.．]\s*(\S+)", answer_tail):
+        number = int(match.group(1))
+        if number not in answers:
+            answers[number] = match.group(2).rstrip(".,;，。；、")
+    return answers
+
+
+def extract_all_answers_from_full_text(text: str) -> dict[int, str]:
+    """Scan the FULL paper text for answers using every known format.
+
+    This is more aggressive than the tail-only approach and is designed for
+    the ``repair-answers`` mode where we re-read the original extracted text.
+    """
+    answers: dict[int, str] = {}
+
+    # --- multiple-choice answers (Q21-55) ---
+    answers.update(parse_answer_tokens(text))
+
+    # --- grammar-fill answers (Q56-65) ---
+    answers.update(parse_grammar_answers(text))
+
+    # --- table-format answers (成都七中 style) ---
+    # Lines like "21~23 CDB 24~27 CBAC" or "41~45 CBDBA" or "21~23DBC" (no space)
+    for match in re.finditer(r"(\d+)\s*~\s*(\d+)\s*[.．]?\s*([A-G]+)", text):
         start, end, letters = int(match.group(1)), int(match.group(2)), match.group(3).strip()
         for offset, number in enumerate(range(start, end + 1)):
-            if offset < len(letters):
+            if offset < len(letters) and number not in answers:
                 answers[number] = letters[offset]
-    for match in re.finditer(r"(\d+)\s*[.．]\s*([A-D])\b", answer_tail):
-        answers[int(match.group(1))] = match.group(2)
+
+    # --- explanation-embedded / double-hyphen format (江南十校 style) ---
+    # "32—35 CACC" with double-hyphen variant "41--45. DADBA"
+    for match in re.finditer(r"(\d+)\s*--\s*(\d+)\s*[.．]?\s*([A-G]+)", text):
+        start, end, letters = int(match.group(1)), int(match.group(2)), match.group(3).strip()
+        for offset, number in enumerate(range(start, end + 1)):
+            if offset < len(letters) and number not in answers:
+                answers[number] = letters[offset]
+
     return answers
 
 
@@ -499,12 +615,31 @@ def answer_range(answer_tail: str, start: int, end: int) -> list[dict]:
 
 
 def grammar_answer_range(answer_tail: str) -> list[dict]:
-    answers: list[dict] = []
-    for match in re.finditer(r"(\d{2})\s*[.．]\s*([^。\n\r]+?)(?=\s+\d{2}\s*[.．]|$)", answer_tail):
-        number = int(match.group(1))
-        if 56 <= number <= 65:
-            answers.append({"number": str(number), "answer": match.group(2).strip()})
-    return answers
+    parsed = parse_grammar_answers(answer_tail)
+    return [{"number": str(number), "answer": answer} for number, answer in sorted(parsed.items())]
+
+
+def trim_writing_answer_extras(text: str) -> str:
+    """Remove answer-book appendices accidentally captured after writing samples."""
+
+    if not text:
+        return ""
+    stop_patterns = [
+        r"(?im)^\s*听力录音稿\s*$",
+        r"(?im)^\s*Text\s*1\b",
+        r"(?im)^\s*(?:A|B|C|D|七选五|完形填空|语法填空)\s*\n\s*【解题导语】",
+        r"(?im)^\s*【解题导语】",
+        r"(?im)^\s*答案解析\s*$",
+        r"(?im)^\s*试题解析\s*$",
+    ]
+    earliest: int | None = None
+    for pattern in stop_patterns:
+        match = re.search(pattern, text)
+        if match and match.start() > 0:
+            earliest = match.start() if earliest is None else min(earliest, match.start())
+    if earliest is not None:
+        text = text[:earliest]
+    return text.strip()
 
 
 def writing_answer_text(answer_tail: str, continuation: bool) -> str:
@@ -512,12 +647,13 @@ def writing_answer_text(answer_tail: str, continuation: bool) -> str:
         return ""
     if continuation:
         idx = answer_tail.find("第二节")
-        return answer_tail[idx:].strip() if idx >= 0 else ""
+        return trim_writing_answer_extras(answer_tail[idx:]) if idx >= 0 else ""
     idx = answer_tail.find("第一节")
     if idx < 0:
         return ""
     end = answer_tail.find("第二节", idx + 1)
-    return answer_tail[idx:end].strip() if end >= 0 else answer_tail[idx:].strip()
+    chunk = answer_tail[idx:end] if end >= 0 else answer_tail[idx:]
+    return trim_writing_answer_extras(chunk)
 
 
 def make_local_segment(
@@ -546,6 +682,9 @@ def make_local_segment(
 def local_segment_paper(source_doc: str, text: str) -> list[dict]:
     body = trim_answer_tail_from_text(text)
     answer_tail = extract_answer_tail(text, max_chars=30000)
+    # Use full-text scan for robust answer extraction (handles table format,
+    # double-hyphen ranges, concatenated grammar answers, etc.)
+    full_answers = extract_all_answers_from_full_text(text)
     lines = line_spans(body)
     starts: list[tuple[int, str, str]] = []
 
@@ -564,7 +703,7 @@ def local_segment_paper(source_doc: str, text: str) -> list[dict]:
             starts.append((lines[idx][0], section, label))
         return idx
 
-    gap_idx = add_start("gap_filling", "七选五", find_line_index(lines, r"七选五|选项中有两项为多余选项"))
+    gap_idx = add_start("gap_filling", "七选五", find_line_index(lines, r"七选五|选项中有两项(?:为)?多余选项"))
     cloze_idx = find_line_index(lines, r"完形填空|完型填空", (gap_idx or 0) + 1)
     if cloze_idx is None:
         cloze_idx = find_line_index(lines, r"第一节.*共\s*15\s*小题.*每小题\s*1\s*分", (gap_idx or 0) + 1)
@@ -593,26 +732,39 @@ def local_segment_paper(source_doc: str, text: str) -> list[dict]:
         "gap_filling": (36, 40),
         "cloze": (41, 55),
     }
+    # Determine the global answer-source label for this paper.
+    if not full_answers:
+        global_answer_source = "原卷未提供答案"
+    else:
+        global_answer_source = "答案区"
+
     for i, (pos, section, label) in enumerate(starts):
         end = starts[i + 1][0] if i + 1 < len(starts) else len(body)
         qtext = body[pos:end].strip()
         if len(qtext) < 80:
             continue
         if section in answer_ranges:
-            ak = answer_range(answer_tail, *answer_ranges[section])
-            answer_source = "答案区" if ak else "未识别"
+            start_q, end_q = answer_ranges[section]
+            ak_list = [{"number": str(n), "answer": full_answers[n]}
+                       for n in range(start_q, end_q + 1) if n in full_answers]
+            answer_source = global_answer_source if ak_list else ("未识别" if full_answers else NO_ANSWER_MARKER)
+            ak = ak_list if ak_list else (NO_ANSWER_MARKER if not full_answers else [])
         elif section == "grammar":
-            ak = grammar_answer_range(answer_tail)
-            answer_source = "答案区" if ak else "未识别"
+            ak_list = [{"number": str(n), "answer": full_answers[n]}
+                       for n in range(56, 66) if n in full_answers]
+            answer_source = global_answer_source if ak_list else ("未识别" if full_answers else NO_ANSWER_MARKER)
+            ak = ak_list if ak_list else (NO_ANSWER_MARKER if not full_answers else [])
         elif section == "practical_writing":
             ak = writing_answer_text(answer_tail, continuation=False)
-            answer_source = "答案区/范文" if ak else "未识别"
+            answer_source = "答案区/范文" if ak else (NO_ANSWER_MARKER if not full_answers else "未识别")
+            ak = ak if ak else (NO_ANSWER_MARKER if not full_answers else "")
         elif section == "continuation_writing":
             ak = writing_answer_text(answer_tail, continuation=True)
-            answer_source = "答案区/范文" if ak else "未识别"
+            answer_source = "答案区/范文" if ak else (NO_ANSWER_MARKER if not full_answers else "未识别")
+            ak = ak if ak else (NO_ANSWER_MARKER if not full_answers else "")
         else:
-            ak = []
-            answer_source = "未识别"
+            ak = NO_ANSWER_MARKER if not full_answers else []
+            answer_source = NO_ANSWER_MARKER if not full_answers else "未识别"
         segments.append(make_local_segment(source_doc, section, label, qtext, ak, answer_source))
     return segments
 
@@ -995,7 +1147,7 @@ def call_chat_completion_http(
                 break
             if attempt < max_retries:
                 time.sleep(retry_delay_seconds(attempt, exc.headers.get("Retry-After")))
-        except (urllib.error.URLError, KeyError, json.JSONDecodeError) as exc:
+        except (urllib.error.URLError, http.client.IncompleteRead, http.client.RemoteDisconnected, KeyError, json.JSONDecodeError) as exc:
             last_error = exc
             if attempt < max_retries:
                 time.sleep(retry_delay_seconds(attempt))
@@ -2052,6 +2204,123 @@ def run_assemble(args: argparse.Namespace) -> None:
     log(args, f"Assembled answers only: {answers_path} ({file_size_label(answers_path)})")
 
 
+def run_repair_answers(args: argparse.Namespace) -> None:
+    """Repair answer_key fields in existing segment JSONs without calling AI.
+
+    Reads the original extracted text for each paper, scans the full text for
+    answers using all known formats (standard ranges, table-format tildes,
+    double-hyphen ranges, concatenated grammar answers, explanation-embedded
+    patterns), and updates the segment JSON files in-place.  Then regenerates
+    ``segment_index.csv`` and runs ``assemble``.
+    """
+    out_dir = Path(args.out)
+    extracted_dir = out_dir / "extracted_text"
+    segments_dir = out_dir / "segments"
+    index_path = out_dir / "segment_index.jsonl"
+
+    if not index_path.exists():
+        raise SystemExit(f"Missing {index_path}. Run --mode segment first.")
+    segment_rows = read_jsonl(index_path)
+    if not segment_rows:
+        raise SystemExit("segment_index.jsonl is empty.")
+
+    # Group segments by source doc
+    by_doc: dict[str, list[dict]] = {}
+    for row in segment_rows:
+        by_doc.setdefault(row["source_doc"], []).append(row)
+
+    log(args, f"Repairing answers for {len(by_doc)} paper(s) using full-text scan (no API calls).")
+    updated_count = 0
+    no_answer_docs: list[str] = []
+
+    for source_doc, rows in sorted(by_doc.items()):
+        stem = safe_stem(source_doc)
+        text_path = extracted_dir / f"{stem}.txt"
+        if not text_path.exists():
+            log(args, f"  skip {source_doc}: extracted text not found at {text_path}")
+            continue
+
+        text = text_path.read_text(encoding="utf-8")
+        full_answers = extract_all_answers_from_full_text(text)
+        answer_tail = extract_answer_tail(text, max_chars=30000)
+
+        if not full_answers:
+            no_answer_docs.append(source_doc)
+
+        answer_ranges = {
+            "reading_a": (21, 23),
+            "reading_b": (24, 27),
+            "reading_c": (28, 31),
+            "reading_d": (32, 35),
+            "gap_filling": (36, 40),
+            "cloze": (41, 55),
+        }
+
+        for row in rows:
+            section = row.get("section", "")
+            seg_path = Path(row["segment_path"])
+            if not seg_path.exists():
+                continue
+            segment = read_json(seg_path)
+            if not isinstance(segment, dict):
+                continue
+
+            if section in answer_ranges:
+                start_q, end_q = answer_ranges[section]
+                ak_list = [{"number": str(n), "answer": full_answers[n]}
+                           for n in range(start_q, end_q + 1) if n in full_answers]
+                answer_source = "答案区" if ak_list else ("原卷未提供答案" if not full_answers else "未识别")
+                segment["answer_key"] = ak_list
+            elif section == "grammar":
+                ak_list = [{"number": str(n), "answer": full_answers[n]}
+                           for n in range(56, 66) if n in full_answers]
+                answer_source = "答案区" if ak_list else ("原卷未提供答案" if not full_answers else "未识别")
+                segment["answer_key"] = ak_list
+            elif section == "practical_writing":
+                ak = writing_answer_text(answer_tail, continuation=False)
+                answer_source = "答案区/范文" if ak else ("原卷未提供答案" if not full_answers else "未识别")
+                segment["answer_key"] = ak
+            elif section == "continuation_writing":
+                ak = writing_answer_text(answer_tail, continuation=True)
+                answer_source = "答案区/范文" if ak else ("原卷未提供答案" if not full_answers else "未识别")
+                segment["answer_key"] = ak
+            else:
+                segment["answer_key"] = []
+                answer_source = "原卷未提供答案" if not full_answers else "未识别"
+
+            segment["answer_source"] = answer_source
+            write_json(seg_path, segment)
+
+            # Update the index row
+            row["answer_count"] = len(segment["answer_key"]) if isinstance(segment["answer_key"], list) else (1 if isinstance(segment["answer_key"], str) and segment["answer_key"].strip() else 0)
+            row["confidence"] = segment.get("confidence", row.get("confidence", ""))
+            updated_count += 1
+
+        extracted = sum(1 for n in range(21, 56) if n in full_answers)
+        grammar = sum(1 for n in range(56, 66) if n in full_answers)
+        log(args, f"  {source_doc}: extracted {extracted}/35 choice + {grammar}/10 grammar answers")
+
+    # Write updated index
+    segment_rows.sort(key=lambda r: (r["source_doc"], section_order(r["section"]), r["item_id"]))
+    write_jsonl(index_path, segment_rows)
+    segment_csv = out_dir / "segment_index.csv"
+    write_csv(
+        segment_csv,
+        segment_rows,
+        ["item_id", "source_doc", "section", "display_section", "item_label", "title", "char_count", "answer_count", "confidence", "rough_unit", "segment_path"],
+    )
+    log(args, f"Updated {updated_count} segment(s).  segment_index rewritten: {segment_csv}")
+
+    if no_answer_docs:
+        log(args, f"Papers marked '原卷未提供答案': {len(no_answer_docs)}")
+        for doc in no_answer_docs:
+            log(args, f"  - {doc}")
+
+    # Auto-run assemble so the repaired answers appear in Markdown
+    log(args, "Re-assembling final Markdown with repaired answers …")
+    run_assemble(args)
+
+
 def run_preflight(args: argparse.Namespace) -> None:
     input_path = Path(args.input)
     out_dir = Path(args.out)
@@ -2099,6 +2368,196 @@ def run_preflight(args: argparse.Namespace) -> None:
         log(args, "  local segmentation warning:")
         for item in low_confidence_docs:
             log(args, f"    - {item}")
+
+
+def run_quality_report(args: argparse.Namespace) -> None:
+    """Generate a Markdown quality report summarising all pipeline outputs.
+
+    This mode is read-only — it never calls the AI, never writes to segment
+    or score files, and is safe to run at any time.
+    """
+    out_dir = Path(args.out)
+    report_path = out_dir / "run_quality_report.md"
+
+    # --- gather data ---
+    docx_files = collect_docx(Path(args.input))
+    segment_csv = out_dir / "segment_index.csv"
+    score_csv = out_dir / "score_index.csv"
+    selected_csv = out_dir / "selected_items.csv"
+    review_notes_path = out_dir / "review_select_notes.json"
+    assembled_dir = out_dir / "assembled"
+
+    segment_rows = list(csv.DictReader(segment_csv.open("r", encoding="utf-8-sig"))) if segment_csv.exists() else []
+    score_rows = list(csv.DictReader(score_csv.open("r", encoding="utf-8-sig"))) if score_csv.exists() else []
+    selected_rows = list(csv.DictReader(selected_csv.open("r", encoding="utf-8-sig"))) if selected_csv.exists() else []
+    review_notes = json.loads(review_notes_path.read_text(encoding="utf-8")) if review_notes_path.exists() else []
+    api_count = len(list((out_dir / "api_conversations").rglob("*.md"))) if (out_dir / "api_conversations").exists() else 0
+
+    # --- per-paper answer coverage ---
+    by_doc: dict[str, dict] = {}
+    for r in segment_rows:
+        doc = r.get("source_doc", "?")
+        if doc not in by_doc:
+            by_doc[doc] = {"segs": 0, "with_answers": 0, "answer_total": 0, "sections": {}}
+        by_doc[doc]["segs"] += 1
+        ac = int(r.get("answer_count", "0"))
+        by_doc[doc]["answer_total"] += ac
+        if ac > 0:
+            by_doc[doc]["with_answers"] += 1
+        sec = r.get("section", "?")
+        by_doc[doc]["sections"][sec] = ac
+
+    # --- score summary per section ---
+    score_by_section: dict[str, list[dict]] = {}
+    for r in score_rows:
+        sec = r.get("section", "?")
+        score_by_section.setdefault(sec, []).append(r)
+
+    # --- selected items ---
+    review_enabled = bool(review_notes)
+
+    # --- build report ---
+    lines: list[str] = []
+    def w(s: str = "") -> None:
+        lines.append(s)
+
+    w(f"# 高三英语模拟题整理质量报告")
+    w()
+    w(f"生成时间：{time.strftime('%Y-%m-%d %H:%M:%S')}")
+    w()
+
+    w("## 1. 输入与输出概览")
+    w()
+    w(f"| 指标 | 值 |")
+    w(f"|---|---|")
+    w(f"| 输入 docx | {len(docx_files)} |")
+    w(f"| 切割 segments | {len(segment_rows)} |")
+    w(f"| 评分记录 | {len(score_rows)} |")
+    w(f"| 入选题目 | {len(selected_rows)} |")
+    w(f"| Pro 复核 | {'✅ 已启用' if review_enabled else '❌ 未启用'} |")
+    w(f"| API 调用次数 | {api_count} |")
+    w()
+
+    # --- output files ---
+    w("### 输出文件")
+    w()
+    w("| 文件 | 大小 |")
+    w("|---|---|")
+    for p in sorted(out_dir.rglob("*")):
+        if p.is_file() and p.suffix in {".csv", ".json", ".jsonl", ".md"}:
+            w(f"| `{p.relative_to(out_dir)}` | {file_size_label(p)} |")
+    w()
+
+    # --- per-paper coverage ---
+    w("## 2. 试卷切割与答案覆盖")
+    w()
+    expected_sections = ["reading_a", "reading_b", "reading_c", "reading_d",
+                        "gap_filling", "cloze", "grammar",
+                        "practical_writing", "continuation_writing"]
+    header = "| 试卷 | segments | 有答案 | 总答案数 | " + " | ".join(SECTION_DISPLAY.get(s, s) for s in expected_sections) + " |"
+    w(header)
+    w("|" + "---|" * (4 + len(expected_sections)) + "")
+    for doc in sorted(by_doc):
+        d = by_doc[doc]
+        parts = [doc[:30], str(d["segs"]), str(d["with_answers"]), str(d["answer_total"])]
+        for s in expected_sections:
+            parts.append(str(d["sections"].get(s, 0)))
+        w("| " + " | ".join(parts) + " |")
+    w()
+
+    # --- score distribution ---
+    w("## 3. 评分分布")
+    w()
+    w("| 题型 | 数量 | 均分·新颖 | 均分·难度 | 均分·词汇 | 均分·语法 | 均分·推荐 |")
+    w("|---|---|---|---|---|---|---|")
+    for sec in expected_sections:
+        items = score_by_section.get(sec, [])
+        if not items:
+            continue
+        n = len(items)
+        avg = lambda key: f"{sum(float(r.get(key, 0) or 0) for r in items) / n:.1f}"
+        w(f"| {SECTION_DISPLAY.get(sec, sec)} | {n} | {avg('novelty_score')} | {avg('difficulty_score')} | {avg('vocabulary_value_score')} | {avg('grammar_value_score')} | {avg('recommendation_score')} |")
+    w()
+
+    # --- selected items ---
+    w("## 4. 入选题目")
+    w()
+    if selected_rows:
+        w("| 题型 | 来源试卷 | 主题 | 评分 |")
+        w("|---|---|---|---|")
+        for r in selected_rows:
+            sec = SECTION_DISPLAY.get(r.get("section", ""), r.get("section", ""))
+            doc = (r.get("source_doc") or "")[:20]
+            topic = (r.get("topic") or "")[:35]
+            sel_score = r.get("selection_score", "")
+            w(f"| {sec} | {doc} | {topic} | {sel_score} |")
+    else:
+        w("*(暂无入选题目 — 请先运行 select 或 review-select)*")
+    w()
+
+    # --- pro review summary ---
+    w("## 5. Pro 复核摘要")
+    w()
+    if review_notes:
+        for entry in review_notes:
+            sec = entry.get("section", "?")
+            selected = entry.get("selected_item_ids", [])
+            reason = (entry.get("review_reason") or "")[:120]
+            w(f"- **{sec}**：入选 {len(selected)} 篇 — {reason}")
+    else:
+        w("*(未运行 review-select，或 review_select_notes.json 不存在)*")
+    w()
+
+    # --- API usage ---
+    w("## 6. API 用量估算")
+    w()
+    if score_rows:
+        total_score_tokens = 0
+        score_files = list((out_dir / "scores").glob("*.json"))
+        for sf in score_files:
+            try:
+                data = json.loads(sf.read_text(encoding="utf-8"))
+                usage = data.get("usage") or {}
+                total_score_tokens += (usage.get("total_tokens") or usage.get("completion_tokens") or 0)
+            except Exception:
+                pass
+        enrich_files = list((out_dir / "enrichments").glob("*.json"))
+        total_enrich_tokens = 0
+        for ef in enrich_files:
+            try:
+                data = json.loads(ef.read_text(encoding="utf-8"))
+                usage = data.get("usage") or {}
+                total_enrich_tokens += (usage.get("total_tokens") or usage.get("completion_tokens") or 0)
+            except Exception:
+                pass
+        w(f"| 阶段 | 调用次数 | 估算 token |")
+        w(f"|---|---|---|")
+        w(f"| segment | 0 (local) | 0 |")
+        w(f"| score | {len(score_rows)} | {total_score_tokens:,} |")
+        w(f"| review-select | {len(review_notes)} | N/A (in conversations) |")
+        w(f"| enrich-selected | {len(selected_rows)} | {total_enrich_tokens:,} |")
+        w(f"| **合计** | **{len(score_rows) + len(review_notes) + len(selected_rows)}** | **{total_score_tokens + total_enrich_tokens:,}** |")
+    else:
+        w("*(暂无评分数据)*")
+    w()
+
+    # --- warnings ---
+    w("## 7. 注意事项")
+    w()
+    warnings_found = 0
+    for r in segment_rows:
+        if float(r.get("confidence", "0") or 0) < 0.75:
+            if warnings_found == 0:
+                w("### 低置信度切割")
+            warnings_found += 1
+            w(f"- `{r.get('item_id', '?')}` — confidence={r.get('confidence', '?')}")
+    if warnings_found == 0:
+        w("✅ 无低置信度切割。")
+    w()
+
+    # --- write ---
+    report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    log(args, f"Quality report written: {report_path} ({file_size_label(report_path)})")
 
 
 def run_stage1(args: argparse.Namespace) -> None:
@@ -2355,7 +2814,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--out", default="outputs/gaokao_english", help="Output folder.")
     parser.add_argument(
         "--mode",
-        choices=["prompts", "analyze", "final", "preflight", "segment", "score", "select", "review-select", "enrich-selected", "assemble", "stage1"],
+        choices=["prompts", "analyze", "final", "preflight", "segment", "score", "select", "review-select", "enrich-selected", "assemble", "repair-answers", "quality-report", "stage1"],
         default="prompts",
     )
     parser.add_argument("--prompt-template", default="config/analysis_prompt_template.md")
@@ -2472,6 +2931,12 @@ def main(argv: list[str]) -> int:
     elif args.mode == "assemble":
         run_assemble(args)
         log(args, f"Pipeline finished successfully: wrote assembled markdown under {Path(args.out)}")
+    elif args.mode == "repair-answers":
+        run_repair_answers(args)
+        log(args, f"Pipeline finished successfully: repaired answers and re-assembled under {Path(args.out)}")
+    elif args.mode == "quality-report":
+        run_quality_report(args)
+        log(args, f"Pipeline finished successfully: quality report written under {Path(args.out)}")
     elif args.mode == "stage1":
         run_stage1(args)
         log(args, f"Pipeline finished successfully: completed stage1 under {Path(args.out)}")

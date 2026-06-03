@@ -139,6 +139,8 @@ TEXT = {
         "review_select_btn": "Pro 复核 review-select",
         "enrich_selected": "补充精讲 enrich",
         "assemble": "组装 assemble",
+        "repair_answers_btn": "修复答案 repair-answers",
+        "quality_report_btn": "质量报告 quality-report",
         "stage1": "一键运行 stage1",
         "no_data": "暂无数据。",
         "view_detail": "查看 {title} 详情",
@@ -274,6 +276,8 @@ TEXT = {
         "review_select_btn": "Pro review",
         "enrich_selected": "Enrich selected",
         "assemble": "Assemble",
+        "repair_answers_btn": "Repair answers",
+        "quality_report_btn": "Quality report",
         "stage1": "Run stage1",
         "no_data": "No data yet.",
         "view_detail": "View {title} detail",
@@ -639,11 +643,13 @@ def run_tab(cfg: dict) -> None:
         (t(cfg, "review_select_btn"), "review-select"),
         (t(cfg, "enrich_selected"), "enrich-selected"),
         (t(cfg, "assemble"), "assemble"),
+        (t(cfg, "repair_answers_btn"), "repair-answers"),
+        (t(cfg, "quality_report_btn"), "quality-report"),
         (t(cfg, "stage1"), "stage1"),
     ]
-    cols = st.columns(4)
+    cols = st.columns(3)
     for i, (label, mode) in enumerate(modes):
-        with cols[i % 4]:
+        with cols[i % 3]:
             if st.button(label, use_container_width=True):
                 if mode == "init-only":
                     cmd = [

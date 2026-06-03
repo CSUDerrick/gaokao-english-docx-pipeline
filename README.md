@@ -153,6 +153,7 @@ outputs/gaokao_english/assembled/final_selected_questions_with_answers.md
 outputs/gaokao_english/assembled/final_teacher_notes.md
 outputs/gaokao_english/assembled/final_answers_only.md
 outputs/gaokao_english/api_conversations/                每次 API 调用的 prompt 和输出，Markdown 保存
+outputs/gaokao_english/run_quality_report.md             自动质量报告（运行 --mode quality-report）
 ```
 
 如果不想保存每次 API 对话，添加：
@@ -160,6 +161,62 @@ outputs/gaokao_english/api_conversations/                每次 API 调用的 pr
 ```bash
 --no-save-conversations
 ```
+
+### 修复答案（不调用 AI）
+
+如果 `segment_index.csv` 中某些卷子 `answer_count` 偏低（常见原因是 docx 答案区使用了表格格式、波浪号 `~`、双短横 `--` 或语法填空拼接在一起），运行 `repair-answers` 重新扫描全文提取答案，并自动重新 assemble：
+
+```bash
+python3 scripts/gaokao_english_docx_pipeline.py input_docx \
+  --out outputs/gaokao_english \
+  --mode repair-answers
+```
+
+这个模式：
+- 不调用 AI，不修改 score / review / enrich 结果
+- 读取 `extracted_text/*.txt` 全文，支持 `-` `—` `~` `--` 四种分隔符，有无空格均可
+- 支持语法填空拼接格式（如 `56. would spark57. playfully`）
+- 更新 `segments/*.json` 的 `answer_key`，重新生成 `segment_index.csv`
+- 自动运行 `assemble` 使答案生效
+
+如果某份试卷确实没有答案区，会被标记为 `原卷未提供答案`。
+
+### 自动质量报告（不调用 AI）
+
+生成一份 Markdown 质量报告，汇总全流程输出：
+
+```bash
+python3 scripts/gaokao_english_docx_pipeline.py input_docx \
+  --out outputs/gaokao_english \
+  --mode quality-report
+```
+
+报告包含：
+- 输入/输出概览（docx 数、segments、评分、入选数、API 调用次数）
+- 每卷 × 每题型答案覆盖矩阵
+- 每题型评分均分分布
+- 入选题目清单
+- Pro 复核摘要
+- API token 用量估算
+- 输出文件大小一览
+
+输出位置：`outputs/gaokao_english/run_quality_report.md`。
+
+### 回归测试
+
+答案解析函数的回归测试位于 `tests/test_answer_extraction.py`。不依赖 pytest，直接运行：
+
+```bash
+python3 tests/test_answer_extraction.py
+```
+
+覆盖的格式：
+- 标准短横线：`21-23 BDC`
+- 全角破折号 + 句号：`21—23. BDB`
+- 波浪号：`21~23 CDB` / `21~23DBC`（无空格）
+- 双短横线：`41--45. DADBA`
+- 语法填空拼接：`56. would spark57. playfully`
+- 5 份真实试卷烟雾测试（每份必须达到 35/35 选择题 + 10/10 语法填空）
 
 ## GUI 运行方式
 
@@ -185,7 +242,8 @@ GUI 包含：
 
 ```text
 状态：查看 docx 数量、segments、scores、selected、最终文件是否生成
-运行：上传 docx、初始化、分步运行 segment/score/select/review-select/assemble、stage1 一键运行
+运行：上传 docx、初始化、分步运行 segment/score/select/review-select/assemble、
+      repair-answers（修复答案）、quality-report（质量报告）、stage1 一键运行
 审核：预览 segment_index.csv、score_index.csv、selected_items.csv、review_select_notes.json
 结果：预览和下载最终 Markdown/CSV
 ```
