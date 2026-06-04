@@ -164,6 +164,30 @@ TEXT = {
         "final_set_note": "学生训练用：题目在前，答案统一在最后。",
         "teacher_note": "教师讲解用：包含评分、入选理由、重点词汇和语法点。",
         "answers_note": "仅答案汇总。",
+        # --- acceptance check ---
+        "acceptance": "本地验收",
+        "acceptance_info": "仅运行本地测试和切分质量检查，不调用 AI API。默认输出目录：outputs/gaokao_english_segment_check",
+        "acceptance_btn": "一键验收切分质量",
+        "acceptance_step_tests": "运行回归测试",
+        "acceptance_step_syntax": "检查语法",
+        "acceptance_step_segment": "本地切分 (segment)",
+        "acceptance_step_quality": "切分质量检查",
+        "acceptance_report": "验收报告",
+        "acceptance_report_path": "报告路径",
+        "acceptance_done": "验收完成，用时 {elapsed:.0f} 秒。报告：{report}",
+        "acceptance_failed_step": "步骤失败：{step}",
+        # --- cost summary ---
+        "cost_summary": "成本统计",
+        "cost_summary_info": "读取已有输出文件汇总 token 用量和 API 调用次数。不会调用模型。",
+        "cost_refresh": "刷新成本统计",
+        "cost_model_settings": "模型设置",
+        "cost_stage_summary": "阶段用量",
+        "cost_total_calls": "总 API 调用次数",
+        "cost_total_tokens": "总 token 用量",
+        "cost_reading": "读取中",
+        "cost_missing": "缺少文件",
+        "cost_missing_hint": "请先运行 stage1 或 quality-report 以生成数据。缺少：{files}",
+        "cost_note": "token 用量为估算值，从 scores/ 和 enrichments/ 的 usage 字段累加得出。review-select 的 token 未单独统计。",
     },
     "en": {
         "language": "Interface Language / 界面语言",
@@ -301,6 +325,30 @@ TEXT = {
         "final_set_note": "Student practice version: questions first, all answers at the end.",
         "teacher_note": "Teacher notes: scores, reasons, vocabulary, and grammar points.",
         "answers_note": "Answers only.",
+        # --- acceptance check ---
+        "acceptance": "Acceptance Check",
+        "acceptance_info": "Runs local tests and segment quality checks only. No AI/API calls. Default output: outputs/gaokao_english_segment_check",
+        "acceptance_btn": "Run Segment Acceptance Check",
+        "acceptance_step_tests": "Running regression tests",
+        "acceptance_step_syntax": "Checking syntax",
+        "acceptance_step_segment": "Local segmentation",
+        "acceptance_step_quality": "Segment quality check",
+        "acceptance_report": "Acceptance Report",
+        "acceptance_report_path": "Report path",
+        "acceptance_done": "Acceptance complete in {elapsed:.0f}s. Report: {report}",
+        "acceptance_failed_step": "Step failed: {step}",
+        # --- cost summary ---
+        "cost_summary": "Cost Summary",
+        "cost_summary_info": "Reads existing output files to summarise token usage and API call counts. No model calls.",
+        "cost_refresh": "Refresh Cost Summary",
+        "cost_model_settings": "Model Settings",
+        "cost_stage_summary": "Stage Usage",
+        "cost_total_calls": "Total API calls",
+        "cost_total_tokens": "Total token usage",
+        "cost_reading": "Reading",
+        "cost_missing": "Missing files",
+        "cost_missing_hint": "Run stage1 or quality-report first to generate data. Missing: {files}",
+        "cost_note": "Token counts are estimates summed from usage fields in scores/ and enrichments/. Review-select tokens are not separately tracked.",
     },
 }
 
@@ -760,12 +808,216 @@ def results_tab(cfg: dict) -> None:
         st.markdown(read_text(selected, limit=60000))
 
 
+def _read_usage_totals(out_dir: Path) -> dict:
+    """Sum token usage from score and enrich JSON files."""
+    result = {
+        "score_calls": 0, "score_tokens": 0,
+        "enrich_calls": 0, "enrich_tokens": 0,
+    }
+    for kind, key in [("scores", "score"), ("enrichments", "enrich")]:
+        d = out_dir / kind
+        if d.exists():
+            for f in d.glob("*.json"):
+                try:
+                    data = json.loads(f.read_text(encoding="utf-8"))
+                    usage = data.get("usage") or {}
+                    tokens = usage.get("total_tokens", 0)
+                    result[f"{key}_calls"] += 1
+                    result[f"{key}_tokens"] += tokens
+                except Exception:
+                    pass
+    return result
+
+
+def cost_summary_tab(cfg: dict) -> None:
+    st.subheader(t(cfg, "cost_summary"))
+    st.info(t(cfg, "cost_summary_info"))
+
+    out_dir_input = st.text_input(
+        t(cfg, "out_dir"), str(Path(cfg["out_dir"])),
+        key="cost_out_dir")
+
+    if st.button(t(cfg, "cost_refresh"), type="primary"):
+        out_dir = Path(out_dir_input)
+        score_csv = out_dir / "score_index.csv"
+        selected_csv = out_dir / "selected_items.csv"
+        review_notes = out_dir / "review_select_notes.json"
+        quality_report = out_dir / "run_quality_report.md"
+
+        # Check required files
+        missing = []
+        for p, label in [(score_csv, "score_index.csv"),
+                         (selected_csv, "selected_items.csv")]:
+            if not p.exists():
+                missing.append(label)
+
+        if missing and not quality_report.exists():
+            st.warning(t(cfg, "cost_missing_hint",
+                        files=", ".join(missing)))
+            return
+
+        # --- compute stats ---
+        usage = _read_usage_totals(out_dir)
+        score_count = len(read_csv_rows(score_csv))
+        selected_count = len(read_csv_rows(selected_csv))
+        has_review = review_notes.exists()
+        has_enrich = (out_dir / "enrichments").exists()
+
+        total_calls = usage["score_calls"] + usage["enrich_calls"]
+        if has_review:
+            total_calls += 9  # ~1 per section
+        total_tokens = usage["score_tokens"] + usage["enrich_tokens"]
+
+        # --- model settings ---
+        st.subheader(t(cfg, "cost_model_settings"))
+        model_cols = st.columns(4)
+        model_cols[0].metric("segment", "local", help="No API calls")
+        model_cols[1].metric("score", "deepseek-v4-flash",
+                            help=f"{usage['score_calls']} calls")
+        model_cols[2].metric("review" if has_review else "review",
+                            "deepseek-v4-pro" if has_review else "N/A",
+                            help="9 calls" if has_review else "Not run")
+        model_cols[3].metric("enrich",
+                            "deepseek-v4-flash" if has_enrich else "N/A",
+                            help=f"{usage['enrich_calls']} calls" if has_enrich else "Not run")
+
+        # --- stage summary ---
+        st.subheader(t(cfg, "cost_stage_summary"))
+        stage_data = [
+            ("segment", "local", 0, 0, "本地，无 API"),
+            ("score", f"{usage['score_calls']} calls",
+             usage["score_tokens"], score_count,
+             f"{score_count} items scored"),
+            ("review-select", f"{'9 calls' if has_review else 'not run'}",
+             None, len(selected_rows) if has_review else 0,
+             f"{len(selected_rows)} selected" if has_review else "not run"),
+            ("enrich-selected",
+             f"{usage['enrich_calls']} calls" if has_enrich else "not run",
+             usage["enrich_tokens"], selected_count,
+             f"{selected_count} items enriched" if has_enrich else "not run"),
+            ("repair-answers", "local", 0, 0, "本地，无 API"),
+            ("assemble", "local", 0, 0, "本地，无 API"),
+            ("quality-report", "local", 0, 0, "本地，无 API"),
+        ]
+
+        cols = st.columns([2, 2, 2, 1, 3])
+        cols[0].write("**Stage**")
+        cols[1].write("**Calls**")
+        cols[2].write("**Tokens**")
+        cols[3].write("**Items**")
+        cols[4].write("**Note**")
+        for name, calls, tokens, items, note in stage_data:
+            cols = st.columns([2, 2, 2, 1, 3])
+            cols[0].write(name)
+            cols[1].write(str(calls))
+            cols[2].write(f"{tokens:,}" if isinstance(tokens, int) else str(tokens or "—"))
+            cols[3].write(str(items))
+            cols[4].write(note)
+
+        # --- totals ---
+        col1, col2 = st.columns(2)
+        col1.metric(t(cfg, "cost_total_calls"), total_calls)
+        col2.metric(t(cfg, "cost_total_tokens"), f"{total_tokens:,}")
+        st.caption(t(cfg, "cost_note"))
+
+        # --- quality report preview ---
+        if quality_report.exists():
+            with st.expander(t(cfg, "acceptance_report"), expanded=False):
+                st.caption(f"`{quality_report}`")
+                text = read_text(quality_report)
+                # Try to extract the API section
+                api_start = text.find("## 6. API 用量估算")
+                if api_start >= 0:
+                    api_end = text.find("## ", api_start + 10)
+                    if api_end < 0:
+                        api_end = len(text)
+                    st.markdown(text[api_start:api_end])
+                    # Also show the "before" sections for context
+                    before = text[:api_start].split("\n")[-5:]
+                    if before:
+                        st.caption("...")
+                else:
+                    st.markdown(read_text(quality_report, 40000))
+        elif missing:
+            st.warning(t(cfg, "cost_missing_hint",
+                        files=", ".join(missing)))
+
+
+def acceptance_tab(cfg: dict) -> None:
+    CHECK_OUT = ROOT / "outputs" / "gaokao_english_segment_check"
+    QUALITY_SCRIPT = ROOT / "scripts" / "check_segment_quality.py"
+    TEST_TAIL = ROOT / "tests" / "test_segment_tail_trim.py"
+    TEST_EXTR = ROOT / "tests" / "test_answer_extraction.py"
+
+    st.subheader(t(cfg, "acceptance"))
+    st.info(t(cfg, "acceptance_info"))
+    st.caption(f"`{CHECK_OUT}`")
+
+    if st.button(t(cfg, "acceptance_btn"), type="primary"):
+        steps = [
+            (t(cfg, "acceptance_step_tests"),
+             [sys.executable, str(TEST_TAIL)]),
+            (t(cfg, "acceptance_step_tests"),
+             [sys.executable, str(TEST_EXTR)]),
+            (t(cfg, "acceptance_step_syntax"),
+             [sys.executable, "-m", "py_compile",
+              str(ROOT / "scripts" / "gaokao_english_docx_pipeline.py"),
+              str(ROOT / "gui_app.py"),
+              str(QUALITY_SCRIPT)]),
+            (t(cfg, "acceptance_step_segment"),
+             [sys.executable, str(SCRIPT),
+              cfg["input_dir"],
+              "--out", str(CHECK_OUT),
+              "--mode", "segment",
+              "--init",
+              "--segment-input", "local"]),
+            (t(cfg, "acceptance_step_quality"),
+             [sys.executable, str(QUALITY_SCRIPT),
+              "--out", str(CHECK_OUT)]),
+        ]
+
+        all_ok = True
+        start = time.time()
+        for step_label, cmd in steps:
+            status = st.status(step_label, expanded=True)
+            with status:
+                st.code(" ".join(cmd), language="bash")
+            proc = subprocess.run(
+                cmd, cwd=str(ROOT), capture_output=True, text=True, timeout=300)
+            if proc.returncode != 0:
+                with status:
+                    st.error(proc.stderr[-2000:] or proc.stdout[-2000:] or "(no output)")
+                all_ok = False
+                st.error(t(cfg, "acceptance_failed_step", step=step_label))
+                break
+            else:
+                with status:
+                    st.success("OK")
+                # Show last few lines of stdout
+                output_lines = [l for l in proc.stdout.splitlines() if l.strip()]
+                if output_lines:
+                    st.code("\n".join(output_lines[-8:]), language="text")
+
+        elapsed = time.time() - start
+
+        if all_ok:
+            report_path = CHECK_OUT / "segment_quality_report.md"
+            if report_path.exists():
+                st.success(t(cfg, "acceptance_done",
+                           elapsed=elapsed, report=str(report_path)))
+                with st.expander(t(cfg, "acceptance_report"), expanded=True):
+                    st.caption(f"{t(cfg, 'acceptance_report_path')}：`{report_path}`")
+                    st.markdown(read_text(report_path, limit=60000))
+            else:
+                st.success(f"All checks passed in {elapsed:.0f}s. (Report not found at {report_path})")
+
+
 def main() -> None:
     st.set_page_config(page_title="高三英语试卷整理", layout="wide")
     cfg = sidebar_config()
     st.title(t(cfg, "title"))
 
-    tabs = st.tabs([t(cfg, "status"), t(cfg, "run"), t(cfg, "review"), t(cfg, "results")])
+    tabs = st.tabs([t(cfg, "status"), t(cfg, "run"), t(cfg, "review"), t(cfg, "results"), t(cfg, "cost_summary"), t(cfg, "acceptance")])
     with tabs[0]:
         show_status(cfg)
     with tabs[1]:
@@ -774,6 +1026,10 @@ def main() -> None:
         review_tab(cfg)
     with tabs[3]:
         results_tab(cfg)
+    with tabs[4]:
+        cost_summary_tab(cfg)
+    with tabs[5]:
+        acceptance_tab(cfg)
 
 
 if __name__ == "__main__":
