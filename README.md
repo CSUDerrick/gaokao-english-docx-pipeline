@@ -70,6 +70,28 @@ Manual exam-paper curation is slow, error-prone, and doesn't scale. A teacher pr
 
 ---
 
+## v0.1 at a Glance
+
+| Stage | AI? | What it does |
+|---|---|---|
+| `preflight` | ❌ local | Count docx, estimate API calls, warn about stale outputs |
+| `segment` | ❌ local | Split papers into 9 exam-section JSONs |
+| `score` | ✅ flash | Lightweight scoring (novelty, difficulty, vocab, grammar) |
+| `select` | ❌ local | Rank and pick top 2 candidates per section |
+| `review-select` | ✅ pro | Re-evaluate shortlist with detailed reasoning |
+| `enrich-selected` | ✅ flash | Vocabulary, grammar, sentences for winners only |
+| `repair-answers` | ❌ local | Full-text answer rescan, fix segment JSONs |
+| `assemble` | ❌ local | Compose 3 Markdown files from segments + scores |
+| `quality-report` | ❌ local | Generate `run_quality_report.md` |
+| `export-docx` | ❌ local | Convert Markdown to Word (stdlib only) |
+| `check_segment_quality` | ❌ local | Per-paper diagnostics with PASS/WARN/FAIL |
+| GUI Acceptance Check | ❌ local | Tests + segment + quality report in one click |
+| GUI Cost Summary | ❌ local | Token usage and API call counts from existing files |
+
+**Verified** — 25 papers: 225 segments, 9 per paper, 0 structural WARN, 0 FAIL.
+
+---
+
 ## Quick Start
 
 ### 1. Prerequisites
@@ -116,6 +138,20 @@ python3 scripts/gaokao_english_docx_pipeline.py input_docx \
   --score-workers 4 \
   --enrich-workers 2 \
   --max-retries 8
+```
+
+If rate-limited (429), use the conservative version:
+
+```bash
+python3 scripts/gaokao_english_docx_pipeline.py input_docx \
+  --out outputs/gaokao_english \
+  --mode stage1 \
+  --init \
+  --client http \
+  --review-select \
+  --score-workers 2 \
+  --enrich-workers 1 \
+  --max-retries 12
 ```
 
 ### 5. Or run step by step (for review)
@@ -309,22 +345,28 @@ The GUI calls the exact same CLI script as a subprocess — behaviour is identic
 
 ## Regression Tests
 
+All tests are local — no AI/API/network needed:
+
 ```bash
-python3 tests/test_answer_extraction.py
+python3 tests/test_answer_extraction.py      # 17 answer-format tests
+python3 tests/test_segment_tail_trim.py      # 10 tail-trimming boundary tests
+python3 tests/test_export_markdown_to_docx.py # 8 Markdown-to-docx tests
+python3 -m py_compile scripts/gaokao_english_docx_pipeline.py gui_app.py \
+  scripts/check_segment_quality.py scripts/export_markdown_to_docx.py
 ```
 
-17 tests covering every known answer format across the 5 real exam papers:
+### Local segment acceptance check
 
-| Format | Example | Test |
-|---|---|---|
-| Standard hyphen | `21-23 BDC` | `test_standard_hyphen_range` |
-| Em-dash + period | `21—23. BDB` | `test_em_dash_range_with_period` |
-| Tilde (spaced) | `21~23 CDB` | `test_tilde_range` |
-| Tilde (no space) | `21~23DBC` | `test_tilde_range_no_space` |
-| Double hyphen | `41--45. DADBA` | `test_double_hyphen_range` |
-| Single-dot | `21. B` | `test_single_dot_answers` |
-| Concatenated grammar | `56. would spark57. playfully` | `test_grammar_concatenated` |
-| Full-text scan | all 5 real papers | `test_real_extracted_texts` |
+```bash
+python3 scripts/gaokao_english_docx_pipeline.py input_docx \
+  --out outputs/gaokao_english_segment_check \
+  --mode segment --init --segment-input local
+
+python3 scripts/check_segment_quality.py \
+  --out outputs/gaokao_english_segment_check
+```
+
+Or use the GUI **Acceptance Check** tab for a one-click equivalent.
 
 ---
 
