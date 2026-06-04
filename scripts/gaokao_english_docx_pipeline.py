@@ -445,33 +445,134 @@ def segment_body(segment: dict) -> str:
 
 def _find_answer_section_start(text: str) -> int | None:
     """Return the character position where the answer section begins, or None."""
-    # Stage 1: answer header on its own line (e.g. "英语答案解析")
-    matches = list(re.finditer(r"(?im)^\s*(?:英语)?(?:参考答案|答案解析|试题答案|英语答案|答案)\s*[:：]?\s*$", text))
+    # --- Stage 1: answer header on its own line ---
+    # Covers: "参考答案", "答案解析", "英语答案", "听力原文", "听力录音稿",
+    # "参考答案及评分标准", "部分试题详解", etc.
+    _ANSWER_HEADER_LINE = (
+        r"(?im)^\s*"
+        r"(?:"
+        r"【?(?:英语|英语试题)?(?:参考)?答案(?:解析|及评分标准|与解析)?【?|"
+        r"【?试题答案【?|"
+        r"【?英语答案【?|"
+        r"【?答案(?:解析|及解析|与解析)?【?|"
+        r"【?(?:附[：:]?\s*)?听力(?:原文|录音稿|录音材料|录音原文)【?|"
+        r"【?录音原文【?|"
+        r"部分试题详解|"
+        r"附[：:]?\s*听力(?:\s*原文)?|"
+        r"参考答案及评分标准|"
+        r"答案及评分标准"
+        r")"
+        r"\s*[:：]?\s*$"
+    )
+    matches = list(re.finditer(_ANSWER_HEADER_LINE, text))
     if matches:
         return matches[-1].start()
 
-    # Stage 2: answer header at end of a line, not necessarily at line start
-    # (e.g. "...故事结尾 _________________________________ 安徽A10联盟...英语答案解析")
-    matches = list(re.finditer(r"(?im)(?:英语|英语试题)?(?:参考)?答案(?:解析)?\s*[:：]?\s*$", text))
+    # --- Stage 2: answer header at end of a line (inline form) ---
+    # e.g. "...故事结尾 ___ 安徽A10联盟...英语答案解析"
+    # e.g. "...壮行考试参考答案及评分标准"
+    _ANSWER_HEADER_INLINE = (
+        r"(?im)"
+        r"(?:"
+        r"(?:英语|英语试题)?(?:参考)?答案(?:解析|及评分标准)?|"
+        r"听力(?:原文|录音稿|录音材料)|"
+        r"参考答案及评分标准|"
+        r"答案及评分标准"
+        r")"
+        r"\s*[:：]?\s*$"
+    )
+    matches = list(re.finditer(_ANSWER_HEADER_INLINE, text))
     if matches:
         candidate = matches[-1].start()
         after = text[candidate : candidate + 300]
         if re.search(r"\d+[-—~]\d+\s*[A-G]|\d+\.[A-G]\b|^\d+\.\s*\w+", after, re.M):
             return candidate
 
-    # Stage 3: look for answer-range lines (e.g. "21-23 BDC  24-27 CCBA") in
-    # the last 25 % of the document and walk backwards to find the nearest
-    # answer header or line boundary.  We restrict to the tail because some
-    # papers embed answer ranges inside explanations earlier in the text.
+    # --- Stage 2.5: model-essay / transcript boundary markers ---
+    # These patterns indicate the answer section has started even without
+    # a formal header.  Only match in the latter 60 % of the document to avoid
+    # false positives when "One possible version" or "听力原文" appear inside
+    # a reading comprehension passage.
+    _TAIL_MARKERS = (
+        r"(?im)^\s*"
+        r"(?:"
+        r"One possible version\s*[:：]?|"
+        r"Possible version\s*[:：]?|"
+        r"【?参考范文】?\s*[:：]?|"
+        r"【?听力(?:原文|录音稿|录音材料|录音原文)】?|"
+        r"【?录音原文】?|"
+        r"【?(?:听力\s*)?答案(?:解析|详解)?】?|"
+        r"附[：:]?\s*听力(?:\s*原文)?|"
+        r"【?解题导语】?|"
+        r"写作\s*(?:第一节|第二节).*参考范文|"
+        r"评分标准|"
+        r"评分原则"
+        r")"
+        r"\s*$"
+    )
+    tail60_start = max(0, len(text) * 2 // 5)  # last 60 %
+    tail_matches = list(re.finditer(_TAIL_MARKERS, text[tail60_start:]))
+    if tail_matches:
+        for tm in tail_matches:
+            candidate = tail60_start + tm.start()
+            marker_text = text[candidate:candidate + 50]
+            # Check whether this is a *strong* answer-section signal.
+            strong_signal = re.search(
+                r"(?im)^\s*(?:One possible version|Possible version|参考范文|范文|"
+                r"听力原文|听力录音稿|听力录音材料|录音原文|"
+                r"评分标准|评分原则|内容要点)",
+                marker_text,
+            )
+            if strong_signal:
+                # Model-essay markers ("One possible version", "参考范文")
+                # can appear for *either* the application-writing or the
+                # continuation-writing section.  We must NOT cut at the
+                # application-writing model essay if the continuation-writing
+                # question text follows it (some papers place both writing
+                # model essays in sequence).
+                after_candidate = text[candidate:]
+                # Only "读后续写", "续写", or "Paragraph 1/2" are specific
+                # to continuation-writing.  Bare "第二节" appears in answer
+                # explanations (七选五/语法填空 analysis) and would cause
+                # false positives.
+                has_cw_after = bool(re.search(
+                    r"(?im)^\s*(?:读后续写|续写|Paragraph\s*[12])",
+                    after_candidate[200:],
+                ))
+                if not has_cw_after:
+                    line_start = text.rfind("\n", 0, candidate) + 1
+                    return line_start
+                # If continuation-writing question IS after this marker,
+                # skip it and keep looking for the next match (which should
+                # be the continuation-writing model essay or transcript).
+                continue
+            # Listening-transcript / rubric markers: always safe to cut.
+            if re.search(
+                r"(?im)(?:听力原文|听力录音稿|听力录音材料|录音原文|"
+                r"评分标准|评分原则|内容要点)",
+                marker_text,
+            ):
+                line_start = text.rfind("\n", 0, candidate) + 1
+                return line_start
+            # For weaker markers, verify they are preceded by a writing
+            # prompt or a blank line.
+            before_match = text[max(0, candidate - 200):candidate]
+            if re.search(r"(?im)(?:读后续写|第二节.*续写|写作.*第二节)\s*$", before_match):
+                line_start = text.rfind("\n", 0, candidate) + 1
+                return line_start
+            if candidate >= 2 and text[candidate - 2:candidate] == "\n\n":
+                line_start = text.rfind("\n", 0, candidate) + 1
+                return line_start
+
+    # --- Stage 3: answer-range lines in the last 25 % ---
     tail_start = max(0, len(text) - max(1, len(text) // 4))
     answer_line = re.search(r"(?m)^\s*\d+[-—~]\d+\s*[.．]?\s*[A-G]+", text[tail_start:])
     if answer_line:
         answer_line_pos = tail_start + answer_line.start()
         before = text[:answer_line_pos]
-        header = re.search(r"(?im)(?:英语)?(?:参考答案|答案解析|试题答案|英语答案)[^\n]{0,30}$", before)
+        header = re.search(r"(?im)(?:英语)?(?:参考答案|答案解析|试题答案|英语答案|听力原文|听力录音稿|录音原文|答案及评分标准)[^\n]{0,30}$", before)
         if header:
             return header.start()
-        # If no header found, start from the answer line itself.
         return answer_line_pos
 
     return None
@@ -704,13 +805,17 @@ def local_segment_paper(source_doc: str, text: str) -> list[dict]:
         return idx
 
     gap_idx = add_start("gap_filling", "七选五", find_line_index(lines, r"七选五|选项中有两项(?:为)?多余选项"))
-    cloze_idx = find_line_index(lines, r"完形填空|完型填空", (gap_idx or 0) + 1)
+    cloze_idx = find_line_index(lines, r"完形填空|完型填空|语言运用", (gap_idx or 0) + 1)
     if cloze_idx is None:
-        cloze_idx = find_line_index(lines, r"第一节.*共\s*15\s*小题.*每小题\s*1\s*分", (gap_idx or 0) + 1)
+        cloze_idx = find_line_index(lines, r"第一节.*共\s*15\s*小题.*[每各]小题\s*1\s*分", (gap_idx or 0) + 1)
+    if cloze_idx is None:
+        cloze_idx = find_line_index(lines, r"第一节.*共\s*15\s*小题.*[每各]题\s*1\s*分", (gap_idx or 0) + 1)
     cloze_idx = add_start("cloze", "完形填空", cloze_idx)
-    grammar_idx = find_line_index(lines, r"语法填空|在空白处填入\s*1\s*个适当的单词", (cloze_idx or gap_idx or 0) + 1)
+    grammar_idx = find_line_index(lines, r"语法填空|在空白处填入\s*1\s*个适当的单词|在空白处填入适当的内容", (cloze_idx or gap_idx or 0) + 1)
     if grammar_idx is None:
-        grammar_idx = find_line_index(lines, r"第二节.*共\s*10\s*小题.*每小题\s*1\.?5\s*分", (cloze_idx or gap_idx or 0) + 1)
+        grammar_idx = find_line_index(lines, r"第二节.*共\s*10\s*(?:小)?题.*[每各](?:小)?题\s*1\.?5\s*分", (cloze_idx or gap_idx or 0) + 1)
+    if grammar_idx is None:
+        grammar_idx = find_line_index(lines, r"第二节.*共\s*10\s*(?:小)?题.*满分\s*15\s*分", (cloze_idx or gap_idx or 0) + 1)
     grammar_idx = add_start("grammar", "语法填空", grammar_idx)
     writing_idx = find_line_index(lines, r"第四部分\s*写作|写作[（(]共两节")
     practical_idx = find_line_index(lines, r"应用文写作|第一节\s*应用文|第一节\s*写作", writing_idx or 0)
