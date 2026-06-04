@@ -247,6 +247,46 @@ outputs/gaokao_english/
 
 ---
 
+## Export to Word (docx)
+
+Convert the assembled Markdown files to `.docx` for printing and distribution.  Uses only the Python standard library — no external dependencies.
+
+### CLI
+
+```bash
+# Export all three Markdown files
+python3 scripts/gaokao_english_docx_pipeline.py input_docx \
+  --out outputs/gaokao_english \
+  --mode export-docx
+```
+
+Outputs:
+
+```text
+outputs/gaokao_english/docx_exports/
+├── final_selected_questions_with_answers.docx
+├── final_teacher_notes.docx
+└── final_answers_only.docx
+```
+
+Or use the standalone script:
+
+```bash
+python3 scripts/export_markdown_to_docx.py \
+  --assembled-dir outputs/gaokao_english/assembled \
+  --out-dir outputs/gaokao_english/docx_exports
+```
+
+### GUI
+
+Click **导出 Word / Export Word** in the Run tab.  This step does not call the AI.
+
+### Supported syntax
+
+Headings (`#` `##` `###`), paragraphs, blank lines, unordered / ordered lists, and fenced code blocks.  Tables are rendered as monospaced text.  **Bold** (`**text**`) is supported.  Fonts default to 等线 / Calibri.
+
+---
+
 ## GUI (Streamlit)
 
 ```bash

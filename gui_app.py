@@ -141,6 +141,7 @@ TEXT = {
         "assemble": "组装 assemble",
         "repair_answers_btn": "修复答案 repair-answers",
         "quality_report_btn": "质量报告 quality-report",
+        "export_docx_btn": "导出 Word export-docx",
         "stage1": "一键运行 stage1",
         "no_data": "暂无数据。",
         "view_detail": "查看 {title} 详情",
@@ -302,6 +303,7 @@ TEXT = {
         "assemble": "Assemble",
         "repair_answers_btn": "Repair answers",
         "quality_report_btn": "Quality report",
+        "export_docx_btn": "Export Word",
         "stage1": "Run stage1",
         "no_data": "No data yet.",
         "view_detail": "View {title} detail",
@@ -693,6 +695,7 @@ def run_tab(cfg: dict) -> None:
         (t(cfg, "assemble"), "assemble"),
         (t(cfg, "repair_answers_btn"), "repair-answers"),
         (t(cfg, "quality_report_btn"), "quality-report"),
+        (t(cfg, "export_docx_btn"), "export-docx"),
         (t(cfg, "stage1"), "stage1"),
     ]
     cols = st.columns(3)

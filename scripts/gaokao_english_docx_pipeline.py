@@ -2919,7 +2919,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--out", default="outputs/gaokao_english", help="Output folder.")
     parser.add_argument(
         "--mode",
-        choices=["prompts", "analyze", "final", "preflight", "segment", "score", "select", "review-select", "enrich-selected", "assemble", "repair-answers", "quality-report", "stage1"],
+        choices=["prompts", "analyze", "final", "preflight", "segment", "score", "select", "review-select", "enrich-selected", "assemble", "repair-answers", "quality-report", "export-docx", "stage1"],
         default="prompts",
     )
     parser.add_argument("--prompt-template", default="config/analysis_prompt_template.md")
@@ -3036,6 +3036,16 @@ def main(argv: list[str]) -> int:
     elif args.mode == "assemble":
         run_assemble(args)
         log(args, f"Pipeline finished successfully: wrote assembled markdown under {Path(args.out)}")
+    elif args.mode == "export-docx":
+        # The export script lives alongside this file; add it to sys.path
+        _scripts_dir = Path(__file__).resolve().parent
+        if str(_scripts_dir) not in sys.path:
+            sys.path.insert(0, str(_scripts_dir))
+        from export_markdown_to_docx import export_markdown_to_docx
+        assembled = Path(args.out) / "assembled"
+        docx_out = Path(args.out) / "docx_exports"
+        created = export_markdown_to_docx(assembled, docx_out)
+        log(args, f"Pipeline finished successfully: exported {len(created)} docx file(s) under {docx_out}")
     elif args.mode == "repair-answers":
         run_repair_answers(args)
         log(args, f"Pipeline finished successfully: repaired answers and re-assembled under {Path(args.out)}")
