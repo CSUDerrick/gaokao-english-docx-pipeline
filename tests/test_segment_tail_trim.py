@@ -30,6 +30,29 @@ def test_cw_then_answer_key():
     assert "参考答案" in text[pos:pos + 20]
 
 
+def test_answer_key_before_later_transcript():
+    """paper-name inline answer header should beat a later listening transcript."""
+    text = _build(
+        "第二节 读后续写\nParagraph 1: Tom had no choice but to ask for help.",
+        "某联盟2026届高三英语参考答案\n1-5 CACBB 6-10 CABAA",
+        "听力原文\nText 1\nW: Have you seen Rita lately?",
+    )
+    pos = _find_answer_section_start(text)
+    assert pos is not None
+    assert "英语参考答案" in text[pos:pos + 30]
+
+
+def test_inline_answer_and_analysis_header():
+    """inline '参考答案及解析' headers should be treated as answer sections."""
+    text = _build(
+        "第二节 读后续写\nParagraph 1: Though her tips were for comedy.",
+        "湖北黄冈中学2026届高三英语试题参考答案及解析\n1—5 BBACB 6—10 ACACB",
+    )
+    pos = _find_answer_section_start(text)
+    assert pos is not None
+    assert "参考答案及解析" in text[pos:pos + 40]
+
+
 def test_cw_then_listening_transcript():
     """continuation_writing → '听力原文' — cut before transcript."""
     text = _build(

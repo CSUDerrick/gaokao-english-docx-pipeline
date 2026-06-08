@@ -34,13 +34,18 @@ SECTION_DISPLAY = {
     "continuation_writing": "读后续写", "unknown": "未识别",
 }
 
-# Tokens that suggest a segment leaked into answer / transcript territory
-LEAK_TOKENS = [
+# Tokens that strongly suggest a segment leaked into answer / transcript territory.
+HARD_LEAK_TOKENS = [
     "答案解析", "参考答案", "试题答案", "英语答案",
     "听力录音稿", "听力原文", "录音原文",
     "Text 1", "Text 2", "Text 3", "Text 4", "Text 5",
     "附：听力", "附听力",
     "第一节（共5小题）", "第二节（共15小题）",
+]
+
+# Tokens that often appear in normal exam instructions and should not by
+# themselves make a segment structurally suspicious.
+SOFT_LAYOUT_TOKENS = [
     "答题卡", "考号", "准考证号",
 ]
 
@@ -70,10 +75,19 @@ def load_segment(seg_path: str) -> dict:
     return json.loads(p.read_text(encoding="utf-8"))
 
 
-def check_leak_tokens(text: str) -> list[str]:
-    """Return leak tokens found in text."""
+def check_hard_leak_tokens(text: str) -> list[str]:
+    """Return answer/transcript leak tokens found in text."""
     found = []
-    for tok in LEAK_TOKENS:
+    for tok in HARD_LEAK_TOKENS:
+        if tok in text:
+            found.append(tok)
+    return found
+
+
+def check_soft_layout_tokens(text: str) -> list[str]:
+    """Return layout/instruction tokens found in text."""
+    found = []
+    for tok in SOFT_LAYOUT_TOKENS:
         if tok in text:
             found.append(tok)
     return found
@@ -146,7 +160,7 @@ def run(out_dir: Path) -> None:
                     qtext = seg_data.get("question_text", "")
                     section = s.get("section", "")
 
-                    leaks = check_leak_tokens(qtext)
+                    leaks = check_hard_leak_tokens(qtext)
                     if leaks and section in {"continuation_writing", "practical_writing"}:
                         # Writing segment leaking into answer/transcript is cosmetic
                         # (known trim_answer_tail_from_text limitation)
@@ -155,6 +169,11 @@ def run(out_dir: Path) -> None:
                     elif leaks:
                         labels = ", ".join(leaks[:3])
                         seg_structural.append(f"疑似含答案/录音边界词: {labels}")
+
+                    soft_layout = check_soft_layout_tokens(qtext)
+                    if soft_layout:
+                        labels = ", ".join(soft_layout[:3])
+                        seg_cosmetic.append(f"含试卷版面提示: {labels}")
 
                     # Writing-specific checks
                     if section in {"practical_writing", "continuation_writing"}:
@@ -300,7 +319,8 @@ def run(out_dir: Path) -> None:
 | 某 segment 文本异常过长 | > 12,000 字符 | WARN |
 | 重复题型 | 同一 docx 中同一 type 出现 > 1 次 | WARN |
 | 含答案/听力边界词 | "答案解析""听力原文""Text 1"等 | WARN |
-| 写作段含范文标记 | "One possible version""【导语】"等 | WARN |
+| 含普通版面提示 | "答题卡""考号""准考证号"等 | PASS* |
+| 写作段含范文标记 | "One possible version""【导语】"等 | PASS* |
 | 缺少全部写作题型 | 无 practical_writing 且无 continuation_writing | WARN |
 | 缺少 3 种以上关键题型 | 3+ critical sections missing | FAIL |
 """)

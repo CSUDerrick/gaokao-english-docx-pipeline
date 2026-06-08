@@ -16,7 +16,8 @@ First stable release of the Gaokao English Docx Pipeline.
 - **Quality report** (`--mode quality-report`): generate `run_quality_report.md` summarising coverage, scores, selections, and token usage.  No AI calls.
 - **Segment quality check** (`scripts/check_segment_quality.py`): per-paper diagnostics with PASS/WARN/FAIL grading.  No AI calls.
 - **Markdown to docx export** (`--mode export-docx` and `scripts/export_markdown_to_docx.py`): pure-stdlib export of all three assembled Markdown files to Word documents with CJK-friendly fonts.
-- **Streamlit GUI** (`gui_app.py`): Chinese/English i18n, parameter tuning, API key management, in-app CSV review, and one-click pipelines for the full workflow, acceptance check, and cost summary.
+- **Streamlit GUI** (`gui_app.py`): teacher-facing workflow, parameter tuning, API key management, in-app CSV review, and one-click pipelines for the full workflow, acceptance check, and cost summary.
+- **Teacher-first GUI modes** (`gui_app.py`): Basic mode now defaults to pasting an API key and clicking one full-workflow button; advanced controls and single-step debug commands are separated into Advanced and Debug modes.
 - **Acceptance Check tab** in GUI: runs regression tests, syntax checks, local segmentation, and quality reporting in one click — no AI calls.
 - **Cost Summary tab** in GUI: reads existing output files to display token usage, API call counts, model settings, and per-stage breakdowns.
 - **Regression tests**: 17 answer-extraction tests, 10 tail-trimming tests, 8 export tests.
@@ -25,7 +26,9 @@ First stable release of the Gaokao English Docx Pipeline.
 
 - Default segment mode is now `local` (was `rough` in early development).  Zero API tokens for segmentation.
 - `score` and `enrich` stages default to `thinking: disabled` to avoid unintended reasoning-token consumption.
-- Default concurrency is conservative (`--score-workers 4`, `--enrich-workers 2`) to reduce 429 rate-limit errors.
+- GUI full workflow now chains `stage1`, `repair-answers`, `quality-report`, and `export-docx`; the local follow-up stages run without API key environment variables.
+- CLI default concurrency is conservative (`--score-workers 4`, `--enrich-workers 2`) to reduce 429 rate-limit errors.
+- GUI Basic mode uses safer daily defaults (`score workers = 2`, `enrich workers = 1`, `max retries = 12`).
 - Max retries default to 8 with exponential backoff respecting `Retry-After` headers.
 
 ### Fixed

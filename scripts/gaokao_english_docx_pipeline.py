@@ -464,9 +464,7 @@ def _find_answer_section_start(text: str) -> int | None:
         r")"
         r"\s*[:：]?\s*$"
     )
-    matches = list(re.finditer(_ANSWER_HEADER_LINE, text))
-    if matches:
-        return matches[-1].start()
+    line_candidates = [match.start() for match in re.finditer(_ANSWER_HEADER_LINE, text)]
 
     # --- Stage 2: answer header at end of a line (inline form) ---
     # e.g. "...故事结尾 ___ 安徽A10联盟...英语答案解析"
@@ -474,19 +472,22 @@ def _find_answer_section_start(text: str) -> int | None:
     _ANSWER_HEADER_INLINE = (
         r"(?im)"
         r"(?:"
-        r"(?:英语|英语试题)?(?:参考)?答案(?:解析|及评分标准)?|"
+        r"(?:英语|英语试题)?(?:参考)?答案(?:解析|及解析|与解析|及评分标准)?|"
         r"听力(?:原文|录音稿|录音材料)|"
         r"参考答案及评分标准|"
         r"答案及评分标准"
         r")"
         r"\s*[:：]?\s*$"
     )
-    matches = list(re.finditer(_ANSWER_HEADER_INLINE, text))
-    if matches:
-        candidate = matches[-1].start()
+    inline_candidates: list[int] = []
+    for match in re.finditer(_ANSWER_HEADER_INLINE, text):
+        candidate = match.start()
         after = text[candidate : candidate + 300]
         if re.search(r"\d+[-—~]\d+\s*[A-G]|\d+\.[A-G]\b|^\d+\.\s*\w+", after, re.M):
-            return candidate
+            inline_candidates.append(candidate)
+
+    if line_candidates or inline_candidates:
+        return min(line_candidates + inline_candidates)
 
     # --- Stage 2.5: model-essay / transcript boundary markers ---
     # These patterns indicate the answer section has started even without
