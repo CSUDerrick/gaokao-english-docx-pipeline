@@ -3,109 +3,117 @@
 这是一个专门帮助高中英语老师把多份散乱的模拟题 Word 文档，自动整理成标准学生版、教师讲解版、答案汇总版并重新导出为规范 Word (.docx) 文档的本地自动化工具。
 
 ## 🎯 它能为您做什么？
-- **智能切分**: 自动把整张试卷按听力、阅读、完形、填空、写作等标准题型精准切分。
-- **异常自动重切**: 本地切分出现结构性 WARN/FAIL 时，只把异常试卷交给模型 rough 重切。
-- **答案提取**: 自动为您提取分散在各处的答案，聚合成一键直达的答案汇总版。
-- **AI 教师讲解**: 自动分析长难句，补充核心词汇拓展、语法点拨，并为您生成教学建议。
-- **AI 轻量评分**: 对试卷和模拟题的难易度与设计质量进行轻量级评估。
+- **保留原卷排版**: 选中的题目**直接从原卷里原样搬运**——字体、字号、加粗、下划线填空线、缩进、表格、插图全部与原卷一致。**您不需要重新调格式。**
+- **智能切分**: 自动把整张试卷按阅读、完形、七选五、语法填空、写作等标准题型精准切分。
+- **答案提取**: 自动提取分散在各处的答案，聚合成答案汇总版。
+- **AI 教师讲解**: 分析长难句，补充核心词汇、语法点拨和教学建议。
+- **AI 轻量评分选题**: 对题目难度与质量做评估，自动挑出每个题型里最值得练的。
+- **支持 PDF 试卷**: 扫描件用 PaddleOCR-VL 识别后，同样走完整流程。
 
-## 🚀 最推荐的使用方式
-打开工具的图形界面（GUI），在 **“基础模式”** 下粘贴 DeepSeek API Key，上传试卷并点击 **“一键开始完整整理”**。页面只显示当前阶段、总进度和预计剩余时间；完成后可直接打开 Word 输出文件夹。
+## 🚀 最推荐的使用方式（macOS）
 
-## 📥 快速部署
+到 [Releases](https://github.com/CSUDerrick/gaokao-english-docx-pipeline/releases) 下载 `.dmg`，
+拖进「应用程序」，双击打开即可。
+
+> ⚠️ 首次打开如果提示「无法打开，因为无法验证开发者」：**右键点图标 →「打开」→ 再点「打开」**。
+> 只需要做这一次，之后双击就能开。（这是因为应用没有花钱做 Apple 公证。）
+
+界面上：选试卷文件夹 → 填 DeepSeek API Key → 点「开始整理」。
+API Key 保存在 macOS 钥匙串里，不会明文落盘。
+
+## 📥 从源码运行（开发者 / Windows / Linux）
 
 ### 环境要求
 - **Python** 3.10 或更高版本
-- **Git**（用于克隆仓库）
-- **Pandoc**（用于导出 .docx，可选但强烈推荐）
-- **DeepSeek API Key**（[免费申请](https://platform.deepseek.com/)，用于 AI 讲解功能）
+- **Git**
+- **DeepSeek API Key**（[申请](https://platform.deepseek.com/)，AI 评分与讲解需要）
+- **PaddleOCR 令牌**（仅处理 PDF 时需要，见下文）
 
-> 💡 **零依赖模式**：如果只需要试卷切分、答案提取等本地功能，无需安装任何 pip 包，Python 标准库即开即用。
-
-### macOS
+> 📌 已不再需要 Pandoc。题目原文改为直接克隆原卷 OOXML，导出不再经过 Markdown。
 
 ```bash
-# 1. 安装系统依赖（如已安装可跳过）
-brew install python@3.13 pandoc git
-
-# 2. 克隆项目
 git clone https://github.com/CSUDerrick/gaokao-english-docx-pipeline.git
 cd gaokao-english-docx-pipeline
 
-# 3. 创建虚拟环境并激活
-python3.13 -m venv .venv
-source .venv/bin/activate
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
 
-# 4. 安装 GUI 依赖
-pip install -r requirements-gui.txt
+pip install -r requirements.txt        # 核心
+pip install -r requirements-gui.txt    # 可选：Streamlit 网页版界面
+pip install -r requirements-app.txt    # 可选：macOS 原生应用 + 打包
 
-# 5. （可选）安装 openai SDK，获得更好的 API 性能
-pip install openai
-
-# 6. 启动图形界面
-streamlit run gui_app.py
+python3 tests/run_tests.py             # 应显示 54 passed
 ```
+
+命令行跑完整流程：
+
+```bash
+export DEEPSEEK_API_KEY=sk-...
+python3 scripts/gaokao_english_docx_pipeline.py input_docx \
+  --out outputs/gaokao_english --mode stage1 --init --client http
+python3 scripts/gaokao_english_docx_pipeline.py input_docx \
+  --out outputs/gaokao_english --mode export-docx
+```
+
+### PDF 试卷
+
+PaddleOCR 的解析服务是**按账号部署**的，没有统一地址，需要您自己去拿：
+
+1. 令牌：https://aistudio.baidu.com/account/accessToken
+2. 服务地址：https://aistudio.baidu.com/paddleocr/task
+
+```bash
+export PADDLEOCR_ACCESS_TOKEN=...
+export PADDLEOCR_BASE_URL=https://<你的专属地址>.aistudio-app.com
+```
+
+把 PDF 和 docx 一起丢进 `input_docx/` 即可，PDF 会先 OCR 成 docx 再走同一条流程。
+
+## 🛠 自己打包 macOS 应用
+
+```bash
+./packaging/build_macos.sh          # 产出 dist/*.app 和 dist/*.dmg
+```
+
+要发给其他老师用（免掉 Gatekeeper 警告），需要 Apple 开发者账号（$99/年），
+然后设好环境变量再跑同一个脚本，代码无需改动：
+
+```bash
+export APPLE_DEV_ID="Developer ID Application: 你的名字 (TEAMID)"
+export APPLE_ID=...  APPLE_TEAM_ID=...  APPLE_APP_PASSWORD=...
+./packaging/build_macos.sh          # 自动签名 + 公证
+```
+
+发布新版本：`git tag v0.4.0 && git push --tags` —— CI 会自动构建 DMG 并发到
+Releases，应用内「检查更新」就是跟它比对的。
 
 ### Windows
 
-在 PowerShell 或命令提示符中执行：
-
 ```powershell
-# 1. 安装系统依赖
-#    方式 A：通过 winget（Win10/Win11 自带）
 winget install Python.Python.3.13
-winget install Pandoc.Pandoc
-#    方式 B：手动下载安装
-#    Python: https://www.python.org/downloads/
-#    Pandoc: https://pandoc.org/installing.html
-#    Git:    https://git-scm.com/download/win
-
-# 2. 克隆项目
+winget install Git.Git
 git clone https://github.com/CSUDerrick/gaokao-english-docx-pipeline.git
 cd gaokao-english-docx-pipeline
-
-# 3. 创建虚拟环境并激活
 python -m venv .venv
 .venv\Scripts\activate
-
-# 4. 安装 GUI 依赖
-pip install -r requirements-gui.txt
-
-# 5. （可选）安装 openai SDK
-pip install openai
-
-# 6. 启动图形界面
+pip install -r requirements.txt -r requirements-gui.txt
 streamlit run gui_app.py
 ```
 
 ### Linux (Ubuntu/Debian)
 
 ```bash
-# 1. 安装系统依赖
-sudo apt update
-sudo apt install -y python3.12 python3.12-venv pandoc git
-
-# 2. 克隆项目
+sudo apt update && sudo apt install -y python3.12 python3.12-venv git
 git clone https://github.com/CSUDerrick/gaokao-english-docx-pipeline.git
 cd gaokao-english-docx-pipeline
-
-# 3. 创建虚拟环境并激活
-python3.12 -m venv .venv
-source .venv/bin/activate
-
-# 4. 安装 GUI 依赖
-pip install -r requirements-gui.txt
-
-# 5. （可选）安装 openai SDK
-pip install openai
-
-# 6. 启动图形界面
+python3.12 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt -r requirements-gui.txt
 streamlit run gui_app.py
 ```
 
-### CLI 极简模式（无 GUI，零 pip 依赖）
+### CLI 模式（无图形界面）
 
-适用于服务器或无图形界面的环境，仅使用标准库即可完成试卷切分和答案提取：
+适用于服务器环境：
 
 ```bash
 # 将你的 .docx 文件放入 input_docx 目录
@@ -160,7 +168,11 @@ export DEEPSEEK_API_KEY="sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 2. `高三英语精选试题_教师讲解版.docx`：A4 讲义版式，包含词汇、语法、长难句和教学建议。
 3. `高三英语精选试题_答案汇总版.docx`：紧凑答案版式，供快速核对。
 
-三份文件均通过固定 Pandoc reference DOCX 模板生成，包含中文字体映射、页眉、页码和稳定的标题/列表样式。
+**学生版和教师讲解版里的题目原文，是从原卷里逐段搬运过来的**——不是重新排版的。
+所以字体、字号、加粗、下划线填空线、缩进、表格和插图都和原卷一模一样，您不需要再调格式。
+AI 讲解作为新段落插入，用统一的「讲解正文 / 讲解标题」样式，可以在 Word 的样式面板里一键改。
+
+答案汇总版没有原始排版可以继承（内容本来就是答案字母和范文），仍由模板生成。
 
 ## 🧭 网页模式
 

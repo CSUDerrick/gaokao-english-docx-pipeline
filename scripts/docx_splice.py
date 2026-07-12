@@ -136,19 +136,47 @@ def decorate(path: Path, heading: str = "", notes: list[tuple[str, str]] | None 
     doc.save(str(path))
 
 
+AUTHOR = "高三英语试卷整理工具"
+
+
 def scrub_metadata(path: Path, title: str) -> None:
     """Drop the original paper's author out of the exported file.
 
     The clone copies ``docProps`` verbatim, which carries the name of whoever
-    authored the source exam (a real person) into the teacher's output.
+    authored the source exam — a real person — into the teacher's output.
+
+    Two things make this fiddlier than it looks, and both have bitten:
+
+    * python-docx's ``core_properties`` setter does not reach the core.xml that
+      docxcompose actually writes, so the name survived a merge.
+    * core.xml can end up holding a *second* ``lastModifiedBy`` whose ``cp:``
+      prefix is bound to the custom-properties namespace rather than
+      core-properties, so a namespace-qualified lookup misses it.
+
+    So: rewrite the part in the zip, and match on local name only.
     """
-    doc = Document(str(path))
-    props = doc.core_properties
-    props.author = "高三英语试卷整理工具"
-    props.last_modified_by = "高三英语试卷整理工具"
-    props.title = title
-    props.comments = ""
-    doc.save(str(path))
+    scrub = {"creator": AUTHOR, "lastModifiedBy": AUTHOR, "title": title,
+             "description": "", "lastPrinted": "", "category": ""}
+
+    with zipfile.ZipFile(path) as zin:
+        entries = [(i, zin.read(i.filename)) for i in zin.infolist()]
+
+    out: list[tuple[zipfile.ZipInfo, bytes]] = []
+    for info, data in entries:
+        if info.filename == "docProps/core.xml":
+            root = etree.fromstring(data)
+            for el in root.iter():
+                if not isinstance(el.tag, str):
+                    continue
+                name = el.tag.rsplit("}", 1)[-1]
+                if name in scrub:
+                    el.text = scrub[name]
+            data = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+        out.append((info, data))
+
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zout:
+        for info, data in out:
+            zout.writestr(info, data)
 
 
 def merge(parts: list[Path], out: Path, page_break: bool = True) -> Path:

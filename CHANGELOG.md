@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.3.0 — 2026-07-12
+
+### Fixed — 排版保真（本版重点）
+
+- **题目原文改为克隆原卷 OOXML，不再重新排版。** 此前 `extract_docx_text` 把 docx 读成
+  一根扁平字符串，原卷 100% 的段落带 `pPr`、100% 的 run 带 `rPr`，全部被丢弃，再由
+  Pandoc 从零重新发明排版——这就是「导出的 Word 还要手动调格式」的根因。
+- **插图不再丢失。** 此前所有导出的 docx 中 media 数量恒为 0（湖北卷 8 张配图全丢）。
+- **段落不再坍缩。** 单换行被 Pandoc 当作软换行，整篇阅读＋题干＋选项被压成一个
+  10008 字符的段落。
+- **`____36____` 不再被误当加粗。** Pandoc 把它解析成 `__strong__`，随机加粗正文。
+- **下划线不再丢失。** 下划线是英语卷的填空线，此前 120 条全部消失。
+
+实测（学生版，旧 → 新）：插图 0→9；下划线 0→120；表格 0→1；最长段落 10008→1051 字符。
+加粗/下划线/斜体/插图/表格数量与原卷对应段落**逐一相等**。
+
+### Added
+
+- `scripts/docx_blocks.py` 块模型：保留每个段落的原始 OOXML 节点；扁平文本与旧实现逐字节一致。
+- `scripts/docx_splice.py` 单源克隆 + `docxcompose` 跨卷合并 + 导出校验。
+- `scripts/pdf_ingest.py` PDF 输入（PaddleOCR-VL 1.6）：OCR → 生成 docx → 走同一条管道。
+- `app/main.py` macOS 原生应用（PySide6）；API Key 存钥匙串；应用内检查更新。
+- `packaging/build_macos.sh` 打包 .app/.dmg，预留签名与公证开关。
+- `.github/workflows/release.yml` 打 tag 自动发版。
+- `requirements.txt`（此前 python-docx / openai / pandoc 全部未声明）。
+
+### Removed
+
+- **Pandoc**（未声明的系统二进制依赖，也是打包 macOS 应用的最大障碍）。
+- 根目录过期的 pipeline 副本（2487 行，缺 3 个模式，只被一个测试引用着）。
+
+### Security
+
+- 清除原卷 `docProps` 里的作者信息（会把出卷老师的真名带进成品）。
+- 补交此前未跟踪但必需的 `scripts/segment_quality.py` 和 `assets/`——`origin/main`
+  此前 clone 下来会直接 ImportError。
+
 ## v0.2.0 — 2026-07-12
 
 ### Added

@@ -228,15 +228,32 @@ def test_validate_rejects_non_a4_page():
         ds.validate(a4)  # must not raise
 
 
-def test_scrub_metadata_removes_original_author():
+def _docprops(path: Path) -> str:
+    with zipfile.ZipFile(path) as z:
+        return "".join(
+            z.read(n).decode("utf-8", "replace") for n in z.namelist() if n.startswith("docProps")
+        )
+
+
+def test_scrub_metadata_removes_original_author_after_merge():
+    # Must be asserted on a MERGED file, not just a clone: python-docx's
+    # core_properties setter does not reach the core.xml that docxcompose
+    # writes, so scrubbing a clone passed while the real export still leaked
+    # the name of the teacher who wrote the source paper.
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
-        src = _fixture(tmp / "a.docx")
-        d = Document(str(src))
-        d.core_properties.author = "某位老师"
-        d.save(str(src))
+        parts = []
+        for i, name in enumerate(("a", "b")):
+            src = _fixture(tmp / f"{name}.docx", marker=name.upper())
+            d = Document(str(src))
+            d.core_properties.author = "某位老师"
+            d.core_properties.last_modified_by = "某位老师"
+            d.save(str(src))
+            parts.append(ds.clone_subset(src, [0, 1], tmp / f"p{i}.docx"))
 
-        out = ds.clone_subset(src, [0], tmp / "c.docx")
-        assert Document(str(out)).core_properties.author == "某位老师"  # inherited by the clone
-        ds.scrub_metadata(out, "学生版")
-        assert Document(str(out)).core_properties.author != "某位老师"
+        assert "某位老师" in _docprops(parts[0]), "the clone should inherit it (that's the bug)"
+
+        merged = ds.merge(parts, tmp / "merged.docx")
+        ds.scrub_metadata(merged, "学生版")
+
+        assert "某位老师" not in _docprops(merged), "original author leaked into the export"
