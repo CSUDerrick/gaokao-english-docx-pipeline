@@ -44,6 +44,7 @@ rm -rf build dist
   --hidden-import export_docx_splice \
   --hidden-import pdf_ingest \
   --hidden-import segment_quality \
+  --hidden-import segment_repair \
   --hidden-import gaokao_english_docx_pipeline \
   --collect-all docx \
   --collect-all docxcompose \
