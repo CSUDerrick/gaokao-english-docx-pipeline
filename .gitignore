@@ -6,3 +6,7 @@ __pycache__/
 input_docx/
 outputs/
 
+# macOS app build artifacts
+build/
+dist/
+*.spec

@@ -1,0 +1,47 @@
+name: Release macOS app
+
+# Publishing an update is: git tag v0.4.0 && git push --tags
+# This builds the .dmg and attaches it to a GitHub Release, which is what the
+# app's "检查更新" button compares itself against.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install -r requirements.txt -r requirements-app.txt
+
+      - name: Run tests
+        run: .venv/bin/python tests/run_tests.py
+
+      - name: Build app and dmg
+        env:
+          # Set these as repo secrets to ship a signed, notarized build that
+          # other teachers can open without a Gatekeeper warning.
+          APPLE_DEV_ID: ${{ secrets.APPLE_DEV_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: ./packaging/build_macos.sh
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.dmg
+          generate_release_notes: true
