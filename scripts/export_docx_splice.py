@@ -18,6 +18,7 @@ import tempfile
 from pathlib import Path
 
 import docx_splice as ds
+from bundle_paths import template_dir
 
 STUDENT = "高三英语精选试题_学生版.docx"
 TEACHER = "高三英语精选试题_教师讲解版.docx"
@@ -65,19 +66,34 @@ def _notes_for(row: dict, pipeline) -> list[tuple[str, str]]:
     return notes
 
 
-TEMPLATE_DIR = Path(__file__).resolve().parents[1] / "assets" / "word_templates"
+TEMPLATE_DIR = template_dir()
+
+
+def _force_a4(doc) -> None:
+    """Set A4 explicitly rather than trusting the template to be found.
+
+    python-docx defaults to US Letter, so if the template ever goes missing the
+    answer sheet silently comes out the wrong size — which is exactly what
+    happened inside the packaged app.
+    """
+    from docx.shared import Cm
+
+    for section in doc.sections:
+        section.page_width = Cm(21.0)
+        section.page_height = Cm(29.7)
 
 
 def _answers_doc(rows: list[dict], out: Path, pipeline) -> Path:
     from docx import Document
 
-    # Built on the existing A4 template so the answer sheet keeps the page size,
-    # Chinese font mapping and footer that the student/teacher versions inherit
-    # from the source papers.
+    # Built on the existing A4 template so the answer sheet keeps the Chinese
+    # font mapping and footer that the student/teacher versions inherit from the
+    # source papers.
     template = TEMPLATE_DIR / "answers_reference.docx"
     doc = Document(str(template)) if template.exists() else Document()
     for para in list(doc.paragraphs):
         para._element.getparent().remove(para._element)
+    _force_a4(doc)
 
     ds.ensure_note_styles(doc)
     doc.add_paragraph("高三英语答案汇总", style=ds.NOTE_HEADING)
@@ -108,6 +124,7 @@ def _plain_doc(heading: str, text: str, notes: list[tuple[str, str]], out: Path)
     doc = Document(str(template)) if template.exists() else Document()
     for para in list(doc.paragraphs):
         para._element.getparent().remove(para._element)
+    _force_a4(doc)
 
     ds.ensure_note_styles(doc)
     doc.add_paragraph(ds.sanitize(heading), style=ds.NOTE_HEADING)

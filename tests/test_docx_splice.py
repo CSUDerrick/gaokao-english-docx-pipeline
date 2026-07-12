@@ -204,6 +204,40 @@ def test_heading_is_prepended_not_appended():
         assert db.read_docx(out).text.startswith("阅读A｜来源：某卷")
 
 
+def test_answer_sheet_is_a4_even_when_the_template_is_missing():
+    # The packaged app could not find its templates (PyInstaller flattens
+    # scripts/, so the __file__-relative lookup pointed outside the bundle), and
+    # python-docx quietly defaulted to US Letter — the export then died on its own
+    # A4 check. Page size must not depend on the template being found.
+    import export_docx_splice as ex
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        original = ex.TEMPLATE_DIR
+        ex.TEMPLATE_DIR = tmp / "does-not-exist"
+        try:
+            out = ex._answers_doc([], tmp / "answers.docx", pipeline=None)
+        finally:
+            ex.TEMPLATE_DIR = original
+
+        with zipfile.ZipFile(out) as z:
+            dx = etree.fromstring(z.read("word/document.xml"))
+        pg = dx.find(".//" + W + "sectPr/" + W + "pgSz")
+        width, height = int(pg.get(W + "w")), int(pg.get(W + "h"))
+        assert 11800 <= width <= 12050 and 16700 <= height <= 17000, f"got {width}x{height}, not A4"
+
+
+def test_exporter_can_find_its_templates():
+    # Would have caught the packaged-app failure: the exporter resolves templates
+    # through its own constant, so that is what must be checked.
+    import export_docx_splice as ex
+    import pdf_ingest
+
+    assert (ex.TEMPLATE_DIR / "answers_reference.docx").exists()
+    assert (ex.TEMPLATE_DIR / "student_reference.docx").exists()
+    assert pdf_ingest.TEMPLATE.exists()
+
+
 def test_validate_rejects_non_a4_page():
     from docx.shared import Cm
 

@@ -33,6 +33,7 @@ from docx import Document
 from docx.shared import Inches
 
 import docx_splice as ds
+from bundle_paths import template_dir
 
 MODEL = "PaddleOCR-VL-1.6"
 TOKEN_ENV = "PADDLEOCR_ACCESS_TOKEN"
@@ -138,7 +139,7 @@ def parse_response(body: dict) -> OcrResult:
     return result
 
 
-TEMPLATE = Path(__file__).resolve().parents[1] / "assets" / "word_templates" / "student_reference.docx"
+TEMPLATE = template_dir() / "student_reference.docx"
 
 
 def blocks_to_docx(result: OcrResult, out: Path) -> Path:

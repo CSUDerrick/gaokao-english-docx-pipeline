@@ -622,13 +622,20 @@ def selftest() -> int:
     """
     import gaokao_english_docx_pipeline as pipeline  # noqa: F401
     import docx_splice  # noqa: F401
-    import export_docx_splice  # noqa: F401
-    import pdf_ingest  # noqa: F401
+    import export_docx_splice
+    import pdf_ingest
     from settings import EFFORTS, MODELS, Settings
 
     assert pipeline.parse_args(["x"]).segment_workers == 16
-    template = BUNDLE / "assets" / "word_templates" / "answers_reference.docx"
-    assert template.exists(), f"missing bundled template: {template}"
+
+    # Check the templates through the *same* path the exporter uses, not through a
+    # path recomputed here. PyInstaller flattens scripts/ onto the top level, so
+    # the exporter's own `__file__`-relative lookup pointed outside the bundle and
+    # it silently fell back to python-docx's US Letter default.
+    for name in ("answers_reference.docx", "student_reference.docx"):
+        found = export_docx_splice.TEMPLATE_DIR / name
+        assert found.exists(), f"exporter cannot find its template: {found}"
+    assert pdf_ingest.TEMPLATE.exists(), f"pdf ingest cannot find its template: {pdf_ingest.TEMPLATE}"
 
     # Every choice the UI offers must be one the pipeline accepts.
     for model in MODELS:
