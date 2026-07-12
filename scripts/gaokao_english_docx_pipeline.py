@@ -1576,6 +1576,45 @@ def collect_docx(input_dir: Path) -> list[Path]:
     return sorted(p for p in input_dir.rglob("*.docx") if not p.name.startswith("~$"))
 
 
+def collect_pdf(input_dir: Path) -> list[Path]:
+    if input_dir.is_file() and input_dir.suffix.lower() == ".pdf":
+        return [input_dir]
+    if input_dir.is_file():
+        return []
+    return sorted(p for p in input_dir.rglob("*.pdf") if not p.name.startswith("~$"))
+
+
+def convert_pdfs(args: argparse.Namespace, out_dir: Path) -> list[Path]:
+    """OCR any PDFs into .docx so the rest of the pipeline sees only Word files.
+
+    The converted files land under the output directory, never next to the
+    teacher's originals — input is never written to.
+    """
+    pdfs = collect_pdf(Path(args.input))
+    if not pdfs:
+        return []
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import pdf_ingest
+
+    converted_dir = out_dir / "pdf_converted"
+    ensure_dir(converted_dir)
+    converted: list[Path] = []
+    for pdf in pdfs:
+        target = converted_dir / f"{pdf.stem}.docx"
+        if target.exists():
+            log(args, f"  reusing existing OCR result for {pdf.name}")
+            converted.append(target)
+            continue
+        log(args, f"  OCR {pdf.name} via PaddleOCR-VL …")
+        converted.append(
+            pdf_ingest.ingest_pdf(
+                pdf, converted_dir, base_url=args.paddle_base_url, token=args.paddle_token
+            )
+        )
+    return converted
+
+
 def call_stage_model(
     args: argparse.Namespace,
     prompt: str,
@@ -1792,9 +1831,9 @@ def run_segment(args: argparse.Namespace) -> list[dict]:
     if args.segment_input != "local" and not api_key:
         raise SystemExit(f"Missing API key. Set {args.api_key_env} or pass --api-key.")
 
-    docx_files = collect_docx(Path(args.input))
+    docx_files = collect_docx(Path(args.input)) + convert_pdfs(args, out_dir)
     if not docx_files:
-        raise SystemExit(f"No .docx files found under {args.input}")
+        raise SystemExit(f"No .docx or .pdf files found under {args.input}")
 
     if args.segment_input == "local":
         log(args, f"Segmenting {len(docx_files)} docx file(s) locally; no segment API calls will be made.")
@@ -3121,6 +3160,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--review-thinking", choices=["enabled", "disabled", "omit"], default="enabled")
     parser.add_argument("--enrich-thinking", choices=["enabled", "disabled", "omit"], default="disabled")
     parser.add_argument("--api-key-env", default="DEEPSEEK_API_KEY")
+    # PDF input. The layout-parsing service is deployed per AI Studio account, so
+    # the base URL has to come from the user's own console — there is no global one.
+    parser.add_argument("--paddle-base-url", default="", help="PaddleOCR layout-parsing URL (or set PADDLEOCR_BASE_URL).")
+    parser.add_argument("--paddle-token", default="", help="AI Studio access token (or set PADDLEOCR_ACCESS_TOKEN).")
     parser.add_argument("--api-key", default="")
     # DEEPSEEK TUNING: `auto` tries the OpenAI SDK first, then falls back to raw HTTP.
     parser.add_argument("--client", choices=["auto", "sdk", "http"], default="auto")
