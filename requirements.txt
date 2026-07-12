@@ -1,0 +1,10 @@
+# Core pipeline. Previously the CLI claimed zero pip dependencies but in fact
+# required `pandoc` as an undeclared system binary; cloning the source docx
+# removes that need, and these wheels bundle cleanly into a macOS .app.
+python-docx==1.2.0    # build explanation paragraphs and the answer sheet
+docxcompose==1.4.1    # merge papers, remapping colliding style/image ids
+lxml>=5.0             # namespace-preserving OOXML (ElementTree mangles it)
+
+# Optional: DeepSeek via the OpenAI SDK. The pipeline falls back to a stdlib
+# urllib client when this is absent (--client http).
+# openai>=1.0

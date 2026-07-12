@@ -17,7 +17,7 @@
 - **Teacher notes** — scores, selection rationale, vocabulary highlights, grammar points, and long-sentence breakdowns.
 - **Answers only** — a compact answer key for quick reference.
 
-The pipeline does NOT simply dump paper content. It **segments** each paper into 9 standard Gaokao question types, **scores** every item with a lightweight AI model, **ranks and selects** the best candidates with a stronger reviewer model, **enriches** only the winners with teaching notes, and **assembles** everything into clean Markdown. The result is a hand-picked, annotated set of 18 items (2 per question type) spanning 5 papers.
+The pipeline does NOT simply dump paper content. It **segments** each paper into standard Gaokao question types, checks structural quality, retries only abnormal papers with rough model segmentation, **scores** every item, **ranks and selects** the best candidates, **enriches** only the winners, and assembles three classroom-ready Word documents.
 
 ### Why this exists
 
@@ -28,14 +28,14 @@ Manual exam-paper curation is slow, error-prone, and doesn't scale. A teacher pr
 | Feature | Description |
 |---|---|
 | **DOCX parsing** | Extracts text from `.docx` without external dependencies (pure stdlib `zipfile` + `xml.etree`). |
-| **Local segmentation** | Splits papers into 9 exam sections (Reading A–D, Gap-filling, Cloze, Grammar, Practical Writing, Continuation Writing) without calling the AI. |
+| **Local-first segmentation** | Splits papers locally; only structural WARN/FAIL papers are retried with rough model segmentation. |
 | **Multi-format answer extraction** | Handles `-` `—` `~` `--` range separators, concatenated grammar answers, table-format keys, and inline-embedded answers. |
 | **Lightweight AI scoring** | Each item is scored on novelty, difficulty, vocabulary value, grammar value, and exam relevance — output is < 200 tokens per item. |
 | **Programmatic selection** | A local ranking formula picks top candidates per section; no AI tokens spent on selection. |
 | **Optional pro review** | A stronger model (`deepseek-v4-pro`) re-evaluates the shortlist with detailed accept/reject reasoning. |
 | **Targeted enrichment** | Only the 18 final selections receive vocabulary lists, grammar/word-formation notes, and long-sentence analysis. |
-| **Three assembled outputs** | Student practice set, teacher notes, and answer-only key — all Markdown. |
-| **Streamlit GUI** | Full graphical interface with Chinese/English i18n, parameter tuning, and in-app CSV review. |
+| **Three polished Word outputs** | Separate A4 templates for student practice, teacher notes, and compact answers, with CJK fonts, headers, and page numbers. |
+| **Streamlit GUI** | Education-blue UI, one-click Basic mode, progress/ETA, fixed auto-scrolling logs, and safe input/output cleanup. |
 | **Quality report** | Generates `run_quality_report.md` summarising coverage, scores, selections, and token usage — no AI calls. |
 | **Answer repair mode** | `--mode repair-answers` rescans extracted text for answers using every known format; fixes segment JSONs without touching AI-generated scores. |
 | **Resumable & retry-safe** | Each stage writes checkpoint files. `Ctrl+C` is safe. `429` rate-limit errors are retried with exponential backoff. |
@@ -59,7 +59,7 @@ Manual exam-paper curation is slow, error-prone, and doesn't scale. A teacher pr
 | **API client** | HTTP mode (stdlib `urllib`) or OpenAI SDK (optional) |
 | **GUI** | Streamlit |
 | **Concurrency** | `concurrent.futures.ThreadPoolExecutor` |
-| **Output formats** | JSON, JSONL, CSV (UTF-8 BOM), Markdown |
+| **Output formats** | JSON, JSONL, CSV (UTF-8 BOM), Markdown, styled DOCX |
 
 ### Design Philosophy
 
@@ -70,12 +70,12 @@ Manual exam-paper curation is slow, error-prone, and doesn't scale. A teacher pr
 
 ---
 
-## v0.1 at a Glance
+## v0.2 at a Glance
 
 | Stage | AI? | What it does |
 |---|---|---|
 | `preflight` | ❌ local | Count docx, estimate API calls, warn about stale outputs |
-| `segment` | ❌ local | Split papers into 9 exam-section JSONs |
+| `segment` | local-first | Local split plus rough-model fallback for structural WARN/FAIL |
 | `score` | ✅ flash | Lightweight scoring (novelty, difficulty, vocab, grammar) |
 | `select` | ❌ local | Rank and pick top 2 candidates per section |
 | `review-select` | ✅ pro | Re-evaluate shortlist with detailed reasoning |
@@ -83,12 +83,12 @@ Manual exam-paper curation is slow, error-prone, and doesn't scale. A teacher pr
 | `repair-answers` | ❌ local | Full-text answer rescan, fix segment JSONs |
 | `assemble` | ❌ local | Compose 3 Markdown files from segments + scores |
 | `quality-report` | ❌ local | Generate `run_quality_report.md` |
-| `export-docx` | ❌ local | Convert Markdown to Word (stdlib only) |
+| `export-docx` | ❌ local | Convert Markdown to three template-styled A4 Word files via Pandoc |
 | `check_segment_quality` | ❌ local | Per-paper diagnostics with PASS/WARN/FAIL |
 | GUI Acceptance Check | ❌ local | Tests + segment + quality report in one click |
 | GUI Cost Summary | ❌ local | Token usage and API call counts from existing files |
 
-**Verified** — 25 papers: 225 segments, 9 per paper, 0 structural WARN, 0 FAIL.
+**Current regression result** — 61 tests passed; all three Word outputs validate as styled A4 OOXML. The historical 25-paper/225-segment benchmark remains documented in `docs/test_results.md`.
 
 ---
 
@@ -135,9 +135,10 @@ python3 scripts/gaokao_english_docx_pipeline.py input_docx \
   --init \
   --client http \
   --review-select \
-  --score-workers 4 \
-  --enrich-workers 2 \
-  --max-retries 8
+  --segment-workers 16 \
+  --score-workers 16 \
+  --enrich-workers 16 \
+  --max-retries 12
 ```
 
 If rate-limited (429), use the conservative version:
@@ -149,8 +150,9 @@ python3 scripts/gaokao_english_docx_pipeline.py input_docx \
   --init \
   --client http \
   --review-select \
-  --score-workers 2 \
-  --enrich-workers 1 \
+  --segment-workers 4 \
+  --score-workers 4 \
+  --enrich-workers 4 \
   --max-retries 12
 ```
 
@@ -164,7 +166,7 @@ python3 scripts/gaokao_english_docx_pipeline.py input_docx \
 
 # Score each segment
 python3 scripts/gaokao_english_docx_pipeline.py input_docx \
-  --out outputs/gaokao_english --mode score --client http --score-workers 4
+  --out outputs/gaokao_english --mode score --client http --score-workers 16
 # → review outputs/gaokao_english/score_index.csv
 
 # Select top candidates locally
@@ -178,7 +180,7 @@ python3 scripts/gaokao_english_docx_pipeline.py input_docx \
 
 # Enrich only selected items with vocabulary/grammar notes
 python3 scripts/gaokao_english_docx_pipeline.py input_docx \
-  --out outputs/gaokao_english --mode enrich-selected --client http --enrich-workers 2
+  --out outputs/gaokao_english --mode enrich-selected --client http --enrich-workers 16
 
 # Assemble final Markdown
 python3 scripts/gaokao_english_docx_pipeline.py input_docx \
@@ -208,7 +210,7 @@ python3 scripts/gaokao_english_docx_pipeline.py input_docx \
 
 ```text
 preflight  →  local pre-check (docx count, expected API calls, stale-output warnings)
-segment    →  local split into 9 exam-section JSONs (no AI)
+segment    →  local split; structural WARN/FAIL papers use rough model fallback
 score      →  deepseek-v4-flash lightweight scoring (no vocab lists)
 select     →  local ranking formula picks top-2 per section
 review-select →  optional deepseek-v4-pro re-evaluation with detailed reasoning
@@ -219,7 +221,7 @@ assemble   →  local Markdown composition (questions + answers + teacher notes)
 ### Model assignments (defaults)
 
 ```text
-segment  →  local (no model)
+segment  →  local first; deepseek-v4-flash only for structural fallback
 score    →  deepseek-v4-flash  (thinking: disabled)
 review   →  deepseek-v4-pro    (thinking: enabled, reasoning_effort: medium)
 enrich   →  deepseek-v4-flash  (thinking: disabled)
@@ -228,15 +230,16 @@ enrich   →  deepseek-v4-flash  (thinking: disabled)
 ### Concurrency & rate limits
 
 ```text
-score-workers  = 4   (conservative; reduce to 2 if 429 still appears)
-enrich-workers = 2   (reduce to 1 if 429 still appears)
-max-retries    = 8   (exponential backoff + Retry-After header honoured)
+segment-workers = 16
+score-workers   = 16
+enrich-workers  = 16   (reduce all three if the provider returns 429)
+max-retries     = 12   (exponential backoff + Retry-After header honoured)
 ```
 
 For persistent `429 Too Many Requests`:
 
 ```bash
---score-workers 2 --enrich-workers 1 --max-retries 12
+--segment-workers 4 --score-workers 4 --enrich-workers 4 --max-retries 12
 ```
 
 ### Thinking mode notes
@@ -285,7 +288,7 @@ outputs/gaokao_english/
 
 ## Export to Word (docx)
 
-Convert the assembled Markdown files to `.docx` for printing and distribution.  Uses only the Python standard library — no external dependencies.
+Convert the assembled Markdown files to `.docx` for printing and distribution. Pandoc applies three committed reference DOCX templates; runtime Python code remains stdlib-only.
 
 ### CLI
 
@@ -300,9 +303,9 @@ Outputs:
 
 ```text
 outputs/gaokao_english/docx_exports/
-├── final_selected_questions_with_answers.docx
-├── final_teacher_notes.docx
-└── final_answers_only.docx
+├── 高三英语精选试题_学生版.docx
+├── 高三英语精选试题_教师讲解版.docx
+└── 高三英语精选试题_答案汇总版.docx
 ```
 
 Or use the standalone script:
@@ -315,11 +318,11 @@ python3 scripts/export_markdown_to_docx.py \
 
 ### GUI
 
-Click **导出 Word / Export Word** in the Run tab.  This step does not call the AI.
+Run the complete workflow or click **10. 导出 Word** in Debug mode. This local step does not call the AI.
 
 ### Supported syntax
 
-Headings (`#` `##` `###`), paragraphs, blank lines, unordered / ordered lists, and fenced code blocks.  Tables are rendered as monospaced text.  **Bold** (`**text**`) is supported.  Fonts default to 等线 / Calibri.
+The templates enforce A4 pages, East Asian font mapping, heading hierarchy, list indentation, headers, page numbers, and per-section pagination.
 
 ---
 
@@ -331,13 +334,14 @@ python3 -m pip install -r requirements-gui.txt
 streamlit run gui_app.py
 ```
 
-The GUI mirrors every CLI mode as a button. It supports:
+The GUI provides three deliberate levels and supports:
 
-- **Chinese / English** language toggle
-- **API key** input with local encrypted storage (`.local/gui_secrets.json`)
-- **Parameter controls** with hover tooltips explaining cost/quality trade-offs
+- **Basic mode** with one full-workflow button, progress bar, current stage, elapsed time, and ETA only
+- **Advanced/Debug modes** with a fixed-height auto-scrolling log panel and prerequisite-aware step buttons
+- **API key** input with local project storage (`.local/gui_secrets.json`)
+- **Separate confirmed actions** for clearing input and output directories
 - **In-app review** of `segment_index.csv`, `score_index.csv`, `selected_items.csv`, and `review_select_notes.json`
-- **Output preview & download** for all assembled Markdown files
+- **Output cards** with Chinese filenames, size/time/status, downloads, and an open-output-folder action
 
 The GUI calls the exact same CLI script as a subprocess — behaviour is identical between GUI and terminal.
 
@@ -348,11 +352,10 @@ The GUI calls the exact same CLI script as a subprocess — behaviour is identic
 All tests are local — no AI/API/network needed:
 
 ```bash
-python3 tests/test_answer_extraction.py      # 17 answer-format tests
-python3 tests/test_segment_tail_trim.py      # 10 tail-trimming boundary tests
-python3 tests/test_export_markdown_to_docx.py # 8 Markdown-to-docx tests
+python3 tests/run_tests.py
 python3 -m py_compile scripts/gaokao_english_docx_pipeline.py gui_app.py \
-  scripts/check_segment_quality.py scripts/export_markdown_to_docx.py
+  scripts/check_segment_quality.py scripts/segment_quality.py \
+  scripts/export_markdown_to_docx.py
 ```
 
 ### Local segment acceptance check
@@ -360,7 +363,7 @@ python3 -m py_compile scripts/gaokao_english_docx_pipeline.py gui_app.py \
 ```bash
 python3 scripts/gaokao_english_docx_pipeline.py input_docx \
   --out outputs/gaokao_english_segment_check \
-  --mode segment --init --segment-input local
+  --mode segment --init --segment-input local --no-segment-warning-fallback
 
 python3 scripts/check_segment_quality.py \
   --out outputs/gaokao_english_segment_check

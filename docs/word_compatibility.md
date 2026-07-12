@@ -8,3 +8,12 @@
   1. **必须**在所有文本写入 docx 之前调用 `_xml_sanitize` 进行正则剥离。
   2. **强制**使用 `Normal` 最基础样式，放弃任何复杂的原生样式嵌套，全部通过 Run 级别的对象属性修改（如 `run.font.bold = True`, `run.font.size`）来实现加粗和字号控制。
   3. 写入前使用 `ElementTree` 对生成的 XML 片段进行内存自检。
+
+## v0.2 排版与兼容策略
+
+- Markdown 到 Word 统一由 Pandoc 完成，不再手写正文 OOXML。
+- 学生版、教师版、答案版分别使用 `assets/word_templates/` 下的 reference DOCX。
+- 每份成品强制校验 A4 纵向页面、页眉、页脚、页码字段及 `eastAsia` 字体映射。
+- 正文使用 Times New Roman + Arial Unicode MS 的中英文映射；标题使用 Arial + Arial Unicode MS。
+- Heading 2 控制题型分页，Heading 3/4 保持标题与后文同页，列表统一缩进，正文启用孤行控制。
+- 模板缺失、Pandoc 不存在、XML 无效或页面不是 A4 时，导出直接失败，不保留“看似成功”的损坏文件。

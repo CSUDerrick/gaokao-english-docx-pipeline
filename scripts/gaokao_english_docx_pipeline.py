@@ -38,6 +38,9 @@ from pathlib import Path
 from typing import Iterable
 from xml.etree import ElementTree as ET
 
+from docx_blocks import DocxDoc, read_docx
+from segment_quality import evaluate_document
+
 
 NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
 
@@ -239,34 +242,13 @@ def node_text(node: ET.Element) -> str:
 
 
 def extract_docx_text(path: Path) -> str:
-    try:
-        with zipfile.ZipFile(path) as zf:
-            xml_bytes = zf.read("word/document.xml")
-    except KeyError as exc:
-        raise RuntimeError(f"{path} does not look like a normal docx: missing word/document.xml") from exc
+    """Flat text of a docx.
 
-    root = ET.fromstring(xml_bytes)
-    body = root.find("w:body", NS)
-    if body is None:
-        return ""
-
-    blocks: list[str] = []
-    for child in body:
-        tag = local_name(child.tag)
-        if tag == "p":
-            text = normalize_inline_text(node_text(child))
-            if text:
-                blocks.append(text)
-        elif tag == "tbl":
-            for row in child.findall(".//w:tr", NS):
-                cells: list[str] = []
-                for cell in row.findall("./w:tc", NS):
-                    cell_text = normalize_inline_text(node_text(cell))
-                    if cell_text:
-                        cells.append(cell_text)
-                if cells:
-                    blocks.append(" | ".join(cells))
-    return "\n".join(blocks)
+    Thin wrapper over ``docx_blocks.read_docx``, which produces byte-identical
+    text but also keeps each paragraph's original OOXML node so the export can
+    clone the source typesetting instead of rebuilding it.
+    """
+    return read_docx(path).text
 
 
 def normalize_inline_text(text: str) -> str:
@@ -765,6 +747,8 @@ def make_local_segment(
     question_text: str,
     answer_key: list[dict] | str,
     answer_source: str,
+    source_path: str = "",
+    source_blocks: list[int] | None = None,
 ) -> dict:
     return {
         "source_doc": source_doc,
@@ -778,11 +762,30 @@ def make_local_segment(
         "answer_source": answer_source,
         "confidence": 0.88 if question_text.strip() else 0.0,
         "prompt_version": "local_segment_v1",
+        # Half-open range of w:body children this question occupies in the source
+        # file. The export clones these nodes verbatim to keep the teacher's own
+        # typesetting (fonts, indents, images). Empty for AI-segmented or OCR
+        # input, where no original OOXML exists to point at.
+        "source_path": source_path,
+        "source_blocks": source_blocks or [],
     }
 
 
-def local_segment_paper(source_doc: str, text: str) -> list[dict]:
-    body = trim_answer_tail_from_text(text)
+def trim_answer_tail_with_offset(text: str) -> tuple[str, int]:
+    """``trim_answer_tail_from_text`` plus how far the result shifted.
+
+    The trimmed body is what the segmenter measures offsets against, but the
+    block map is indexed against the *untrimmed* text. ``.strip()`` can drop
+    leading characters, so return the delta rather than assuming it is zero.
+    """
+    start = _find_answer_section_start(text)
+    raw = text if start is None else text[:start]
+    lead = len(raw) - len(raw.lstrip())
+    return raw.strip(), lead
+
+
+def local_segment_paper(source_doc: str, text: str, doc: DocxDoc | None = None) -> list[dict]:
+    body, body_offset = trim_answer_tail_with_offset(text)
     answer_tail = extract_answer_tail(text, max_chars=30000)
     # Use full-text scan for robust answer extraction (handles table format,
     # double-hyphen ranges, concatenated grammar answers, etc.)
@@ -871,7 +874,23 @@ def local_segment_paper(source_doc: str, text: str) -> list[dict]:
         else:
             ak = NO_ANSWER_MARKER if not full_answers else []
             answer_source = NO_ANSWER_MARKER if not full_answers else "未识别"
-        segments.append(make_local_segment(source_doc, section, label, qtext, ak, answer_source))
+
+        # Map this question's char span back to the w:body children it came from,
+        # so export can clone the original paragraphs. Offsets are measured
+        # against the trimmed body, hence the shift back into full-text space.
+        source_blocks: list[int] = []
+        source_path = ""
+        if doc is not None:
+            lo, hi = doc.body_range(pos + body_offset, end + body_offset)
+            source_blocks = [lo, hi]
+            source_path = str(doc.path)
+
+        segments.append(
+            make_local_segment(
+                source_doc, section, label, qtext, ak, answer_source,
+                source_path=source_path, source_blocks=source_blocks,
+            )
+        )
     return segments
 
 
@@ -1652,12 +1671,13 @@ def segment_docx_file(docx: Path, args: argparse.Namespace, out_dir: Path) -> li
     ensure_dir(rough_dir)
 
     source_doc = docx.name
-    text = extract_docx_text(docx)
+    doc = read_docx(docx)
+    text = doc.text
     text_path = extracted_dir / f"{safe_stem(source_doc)}.txt"
     text_path.write_text(text, encoding="utf-8")
 
     if args.segment_input == "local":
-        segments = local_segment_paper(source_doc, text)
+        segments = local_segment_paper(source_doc, text, doc)
         write_json(rough_dir / f"{safe_stem(source_doc)}__local_segments.json", segments)
         counters: dict[str, int] = {}
         rows: list[dict] = []
@@ -1765,6 +1785,9 @@ def segment_docx_file(docx: Path, args: argparse.Namespace, out_dir: Path) -> li
 def run_segment(args: argparse.Namespace) -> list[dict]:
     out_dir = Path(args.out)
     ensure_dir(out_dir)
+    fallback_report_path = out_dir / "segment_fallback_report.json"
+    if args.segment_input == "local" and fallback_report_path.exists():
+        fallback_report_path.unlink()
     api_key = args.api_key or os.environ.get(args.api_key_env)
     if args.segment_input != "local" and not api_key:
         raise SystemExit(f"Missing API key. Set {args.api_key_env} or pass --api-key.")
@@ -1789,6 +1812,82 @@ def run_segment(args: argparse.Namespace) -> list[dict]:
             except Exception as exc:
                 log(args, f"  segment failed for {docx.name}: {exc}")
                 raise
+
+    fallback_records: list[dict] = []
+    if args.segment_input == "local" and args.segment_warning_fallback:
+        rows_by_doc: dict[str, list[dict]] = {}
+        for row in rows:
+            rows_by_doc.setdefault(row["source_doc"], []).append(row)
+        quality_by_doc = {
+            doc: evaluate_document(doc, doc_rows)
+            for doc, doc_rows in rows_by_doc.items()
+        }
+        needs_fallback = {
+            doc: result
+            for doc, result in quality_by_doc.items()
+            if result["needs_model_fallback"]
+        }
+        if needs_fallback:
+            if not api_key:
+                summary = "; ".join(
+                    f"{doc}: {', '.join(result['structural_issues'][:2])}"
+                    for doc, result in needs_fallback.items()
+                )
+                raise SystemExit(
+                    "Local segmentation produced structural WARN/FAIL and model fallback requires an API key. "
+                    f"Problems: {summary}. Set {args.api_key_env}, or use --no-segment-warning-fallback for local diagnostics only."
+                )
+            log(args, f"Structural segmentation warning in {len(needs_fallback)} paper(s); retrying only those papers with model rough segmentation.")
+            docx_by_name = {path.name: path for path in docx_files}
+            fallback_args = argparse.Namespace(**vars(args))
+            fallback_args.segment_input = "rough"
+            replacement_rows: dict[str, list[dict]] = {}
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.segment_workers)) as executor:
+                future_map = {
+                    executor.submit(segment_docx_file, docx_by_name[doc], fallback_args, out_dir): doc
+                    for doc in needs_fallback
+                }
+                for future in concurrent.futures.as_completed(future_map):
+                    doc = future_map[future]
+                    model_rows = future.result()
+                    model_quality = evaluate_document(doc, model_rows)
+                    replacement_rows[doc] = model_rows
+                    fallback_records.append({
+                        "source_doc": doc,
+                        "local_grade": needs_fallback[doc]["grade"],
+                        "local_issues": needs_fallback[doc]["structural_issues"],
+                        "fallback_mode": "rough",
+                        "model": args.segment_model,
+                        "final_grade": model_quality["grade"],
+                        "final_issues": model_quality["structural_issues"],
+                        "final_segment_count": len(model_rows),
+                    })
+                    log(args, f"  model re-segmented {doc}: {len(model_rows)} item(s), grade={model_quality['grade']}.")
+
+            final_rows: list[dict] = []
+            unresolved: list[dict] = []
+            for doc, local_rows in rows_by_doc.items():
+                if doc not in replacement_rows:
+                    final_rows.extend(local_rows)
+                    continue
+                model_rows = replacement_rows[doc]
+                model_paths = {str(row.get("segment_path") or "") for row in model_rows}
+                for old_row in local_rows:
+                    old_path = Path(str(old_row.get("segment_path") or ""))
+                    if str(old_path) not in model_paths and old_path.exists():
+                        old_path.unlink()
+                final_rows.extend(model_rows)
+                final_quality = evaluate_document(doc, model_rows)
+                if final_quality["needs_model_fallback"]:
+                    unresolved.append(final_quality)
+            rows = final_rows
+            write_json(fallback_report_path, fallback_records)
+            if unresolved:
+                summary = "; ".join(
+                    f"{item['doc']}: {', '.join(item['structural_issues'][:2])}"
+                    for item in unresolved
+                )
+                raise SystemExit(f"Model segmentation still has structural WARN/FAIL; scoring stopped. {summary}")
 
     rows.sort(key=lambda r: (r["source_doc"], section_order(r["section"]), r["item_id"]))
     segment_index = out_dir / "segment_index.jsonl"
@@ -2215,13 +2314,36 @@ def render_sentences(points: object) -> str:
     if not isinstance(points, list) or not points:
         return "暂无"
     parts: list[str] = []
-    for item in points[:5]:
+    for index, item in enumerate(points[:5], start=1):
         if isinstance(item, dict):
             sentence = item.get("sentence", "")
             analysis = item.get("structure_analysis", "")
             teaching = item.get("teaching_point", "")
-            parts.append(f"- {sentence}\n  结构：{analysis}\n  讲解：{teaching}".strip())
+            parts.append(
+                f"{index}. **原句：** {sentence}\n"
+                f"   - **结构：** {analysis}\n"
+                f"   - **讲解：** {teaching}"
+            )
     return "\n".join(parts) or "暂无"
+
+
+def merge_cached_enrichments(selected: list[dict], enriched_cache: object) -> int:
+    if not isinstance(enriched_cache, list):
+        return 0
+    enrichment_by_id = {
+        str(item.get("item_id") or ""): item.get("enrichment")
+        for item in enriched_cache
+        if isinstance(item, dict) and isinstance(item.get("enrichment"), dict)
+    }
+    merged = 0
+    for item in selected:
+        if not isinstance(item, dict) or isinstance(item.get("enrichment"), dict):
+            continue
+        cached = enrichment_by_id.get(str(item.get("item_id") or ""))
+        if isinstance(cached, dict):
+            item["enrichment"] = cached
+            merged += 1
+    return merged
 
 
 def run_assemble(args: argparse.Namespace) -> None:
@@ -2232,13 +2354,32 @@ def run_assemble(args: argparse.Namespace) -> None:
     selected = read_json(selection_path)
     if not isinstance(selected, list):
         raise SystemExit(f"Invalid {selection_path}")
+    enriched_cache_path = out_dir / "selected_items.enriched.json"
+    if enriched_cache_path.exists():
+        enriched_cache = read_json(enriched_cache_path)
+        merged = merge_cached_enrichments(selected, enriched_cache)
+        if merged:
+            log(args, f"Merged cached enrichment into {merged} selected item(s) before assembly.")
     assembled_dir = out_dir / "assembled"
     ensure_dir(assembled_dir)
 
     ordered = sorted(selected, key=lambda r: (section_order(r.get("section", "")), r.get("source_doc", ""), r.get("item_id", "")))
-    question_lines = ["# 高三英语精选训练题", "", "## 题目"]
+    question_lines = [
+        "# 高三英语精选训练题",
+        "",
+        "> 本文档按题型整理，可直接用于打印、课堂训练或课后练习。",
+    ]
     answer_lines = ["", "## 答案汇总"]
-    teacher_lines = ["# 教师讲解与评分说明", ""]
+    answers_only_lines = [
+        "# 高三英语答案汇总",
+        "",
+        "> 按题型和题目顺序汇总，供教师快速核对。",
+    ]
+    teacher_lines = [
+        "# 教师讲解与评分说明",
+        "",
+        "> 包含选题依据、重点词汇、语法考点、长难句分析和课堂建议。",
+    ]
 
     current_section = ""
     for row in ordered:
@@ -2248,15 +2389,16 @@ def run_assemble(args: argparse.Namespace) -> None:
         score = score | enrichment
         section_name = row.get("display_section") or section_display(row.get("section", ""))
         if section_name != current_section:
-            question_lines.extend(["", f"### {section_name}"])
+            question_lines.extend(["", f"## {section_name}"])
             answer_lines.extend(["", f"### {section_name}"])
+            answers_only_lines.extend(["", f"## {section_name}"])
             teacher_lines.extend(["", f"## {section_name}"])
             current_section = section_name
         title = md_escape_heading(segment.get("title") or score.get("topic") or row.get("item_label"))
         question_lines.extend(
             [
                 "",
-                f"#### {row.get('item_label', '')}｜{title}",
+                f"### {row.get('item_label', '')}｜{title}",
                 "",
                 f"来源：{row.get('source_doc', '')}",
                 "",
@@ -2267,6 +2409,14 @@ def run_assemble(args: argparse.Namespace) -> None:
             [
                 "",
                 f"#### {row.get('item_label', '')}｜{title}",
+                "",
+                answer_key_text(segment.get("answer_key")),
+            ]
+        )
+        answers_only_lines.extend(
+            [
+                "",
+                f"### {row.get('item_label', '')}｜{title}",
                 "",
                 answer_key_text(segment.get("answer_key")),
             ]
@@ -2282,20 +2432,22 @@ def run_assemble(args: argparse.Namespace) -> None:
                 f"- 入选理由：{score.get('selection_reason', '')}",
                 f"- 课堂建议：{score.get('classroom_suggestion', '')}",
                 "",
-                "重点词汇：",
+                "#### 重点词汇",
                 render_words(score.get("core_high_frequency_words", []))
                 + "\n"
                 + render_words(score.get("familiar_words_new_meanings", []))
                 + "\n"
                 + render_words(score.get("difficult_or_low_frequency_words", [])),
                 "",
-                "语法与词汇变形：",
+                "#### 语法与词汇变形",
                 render_grammar(score.get("word_formation_and_grammar", [])),
                 "",
-                "长难句：",
+                "#### 长难句",
                 render_sentences(score.get("long_difficult_sentences", [])),
                 "",
-                f"补充讲解建议：{score.get('teaching_notes', '')}",
+                "#### 补充讲解建议",
+                "",
+                str(score.get("teaching_notes", "") or "暂无"),
             ]
         )
 
@@ -2304,7 +2456,7 @@ def run_assemble(args: argparse.Namespace) -> None:
     answers_path = assembled_dir / "final_answers_only.md"
     final_set_path.write_text("\n".join(question_lines + answer_lines) + "\n", encoding="utf-8")
     teacher_path.write_text("\n".join(teacher_lines) + "\n", encoding="utf-8")
-    answers_path.write_text("\n".join(answer_lines).strip() + "\n", encoding="utf-8")
+    answers_path.write_text("\n".join(answers_only_lines).strip() + "\n", encoding="utf-8")
     log(args, f"Assembled final set: {final_set_path} ({file_size_label(final_set_path)})")
     log(args, f"Assembled teacher notes: {teacher_path} ({file_size_label(teacher_path)})")
     log(args, f"Assembled answers only: {answers_path} ({file_size_label(answers_path)})")
@@ -2491,12 +2643,16 @@ def run_quality_report(args: argparse.Namespace) -> None:
     score_csv = out_dir / "score_index.csv"
     selected_csv = out_dir / "selected_items.csv"
     review_notes_path = out_dir / "review_select_notes.json"
+    fallback_report_path = out_dir / "segment_fallback_report.json"
     assembled_dir = out_dir / "assembled"
 
     segment_rows = list(csv.DictReader(segment_csv.open("r", encoding="utf-8-sig"))) if segment_csv.exists() else []
     score_rows = list(csv.DictReader(score_csv.open("r", encoding="utf-8-sig"))) if score_csv.exists() else []
     selected_rows = list(csv.DictReader(selected_csv.open("r", encoding="utf-8-sig"))) if selected_csv.exists() else []
     review_notes = json.loads(review_notes_path.read_text(encoding="utf-8")) if review_notes_path.exists() else []
+    fallback_records = json.loads(fallback_report_path.read_text(encoding="utf-8")) if fallback_report_path.exists() else []
+    if not isinstance(fallback_records, list):
+        fallback_records = []
     api_count = len(list((out_dir / "api_conversations").rglob("*.md"))) if (out_dir / "api_conversations").exists() else 0
 
     # --- per-paper answer coverage ---
@@ -2638,7 +2794,7 @@ def run_quality_report(args: argparse.Namespace) -> None:
                 pass
         w(f"| 阶段 | 调用次数 | 估算 token |")
         w(f"|---|---|---|")
-        w(f"| segment | 0 (local) | 0 |")
+        w(f"| segment | {len(fallback_records)} paper fallback(s) | N/A (in conversations) |")
         w(f"| score | {len(score_rows)} | {total_score_tokens:,} |")
         w(f"| review-select | {len(review_notes)} | N/A (in conversations) |")
         w(f"| enrich-selected | {len(selected_rows)} | {total_enrich_tokens:,} |")
@@ -2650,6 +2806,17 @@ def run_quality_report(args: argparse.Namespace) -> None:
     # --- warnings ---
     w("## 7. 注意事项")
     w()
+    if fallback_records:
+        w("### 自动模型重切记录")
+        w()
+        w("| 试卷 | 本地等级 | 回退方式 | 模型 | 最终等级 |")
+        w("|---|---|---|---|---|")
+        for item in fallback_records:
+            w(
+                f"| {item.get('source_doc', '')} | {item.get('local_grade', '')} | "
+                f"{item.get('fallback_mode', '')} | {item.get('model', '')} | {item.get('final_grade', '')} |"
+            )
+        w()
     warnings_found = 0
     for r in segment_rows:
         if float(r.get("confidence", "0") or 0) < 0.75:
@@ -2933,10 +3100,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--score-model", default="deepseek-v4-flash", help="Model used to score each segmented item.")
     parser.add_argument("--review-model", default="deepseek-v4-pro", help="Model used to review local shortlist selections.")
     parser.add_argument("--enrich-model", default="deepseek-v4-flash", help="Model used to enrich final selected items with words/grammar/sentences.")
-    parser.add_argument("--segment-workers", type=int, default=4, help="Concurrent docx segmentation requests.")
-    parser.add_argument("--score-workers", type=int, default=4, help="Concurrent scoring requests.")
-    parser.add_argument("--enrich-workers", type=int, default=2, help="Concurrent enrichment requests for selected items.")
+    parser.add_argument("--segment-workers", type=int, default=16, help="Concurrent docx segmentation requests.")
+    parser.add_argument("--score-workers", type=int, default=16, help="Concurrent scoring requests.")
+    parser.add_argument("--enrich-workers", type=int, default=16, help="Concurrent enrichment requests for selected items.")
     parser.add_argument("--segment-input", choices=["local", "rough", "full"], default="local", help="local parses common exam structure without API; rough/full use model segmentation.")
+    parser.add_argument(
+        "--segment-warning-fallback",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When local segmentation has structural WARN/FAIL, re-segment only affected papers with rough model chunks.",
+    )
     parser.add_argument("--answer-tail-chars", type=int, default=8000, help="Characters of the final answer area appended to rough segment chunks.")
     parser.add_argument("--review-candidates", type=int, default=6, help="Local shortlist size per section before pro review.")
     parser.add_argument("--segment-reasoning-effort", choices=["none", "low", "medium", "high"], default="none")
@@ -3042,10 +3215,11 @@ def main(argv: list[str]) -> int:
         _scripts_dir = Path(__file__).resolve().parent
         if str(_scripts_dir) not in sys.path:
             sys.path.insert(0, str(_scripts_dir))
-        from export_markdown_to_docx import export_markdown_to_docx
-        assembled = Path(args.out) / "assembled"
+        import export_docx_splice
         docx_out = Path(args.out) / "docx_exports"
-        created = export_markdown_to_docx(assembled, docx_out)
+        created = export_docx_splice.export_selected(
+            Path(args.out), sys.modules[__name__], log=lambda m: log(args, m)
+        )
         log(args, f"Pipeline finished successfully: exported {len(created)} docx file(s) under {docx_out}")
     elif args.mode == "repair-answers":
         run_repair_answers(args)

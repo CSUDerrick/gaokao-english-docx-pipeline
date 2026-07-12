@@ -9,55 +9,17 @@ from __future__ import annotations
 
 import argparse
 import csv
-import json
-import re
-import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
-
-EXPECTED_SECTIONS = [
-    "reading_a", "reading_b", "reading_c", "reading_d",
-    "gap_filling", "cloze", "grammar",
-    "practical_writing", "continuation_writing",
-]
-
-CRITICAL_SECTIONS = {
-    "reading_a", "reading_b", "reading_c", "reading_d",
-    "cloze", "grammar", "practical_writing", "continuation_writing",
-}
-
-SECTION_DISPLAY = {
-    "reading_a": "阅读A", "reading_b": "阅读B", "reading_c": "阅读C",
-    "reading_d": "阅读D", "gap_filling": "七选五", "cloze": "完形填空",
-    "grammar": "语法填空", "practical_writing": "应用文",
-    "continuation_writing": "读后续写", "unknown": "未识别",
-}
-
-# Tokens that strongly suggest a segment leaked into answer / transcript territory.
-HARD_LEAK_TOKENS = [
-    "答案解析", "参考答案", "试题答案", "英语答案",
-    "听力录音稿", "听力原文", "录音原文",
-    "Text 1", "Text 2", "Text 3", "Text 4", "Text 5",
-    "附：听力", "附听力",
-    "第一节（共5小题）", "第二节（共15小题）",
-]
-
-# Tokens that often appear in normal exam instructions and should not by
-# themselves make a segment structurally suspicious.
-SOFT_LAYOUT_TOKENS = [
-    "答题卡", "考号", "准考证号",
-]
-
-# Tokens specific to writing segments that suggest answer-model-essay bleed
-WRITING_LEAK_TOKENS = [
-    "One possible version", "Possible version",
-    "参考范文", "范文",
-    "评分标准", "评分原则",
-    "写作要点", "内容要点",
-    "【导语】", "【详解】", "【点睛】",
-    "词汇积累", "句式拓展",
-]
+from segment_quality import (
+    EXPECTED_SECTIONS,
+    HARD_LEAK_TOKENS,
+    SECTION_DISPLAY,
+    SOFT_LAYOUT_TOKENS,
+    WRITING_LEAK_TOKENS,
+    evaluate_document,
+)
 
 
 def collect_rows(out_dir: Path) -> list[dict]:
@@ -66,13 +28,6 @@ def collect_rows(out_dir: Path) -> list[dict]:
         raise SystemExit(f"Missing {csv_path}. Run --mode segment first.")
     with csv_path.open("r", encoding="utf-8-sig") as f:
         return list(csv.DictReader(f))
-
-
-def load_segment(seg_path: str) -> dict:
-    p = Path(seg_path)
-    if not p.is_absolute():
-        p = Path.cwd() / p
-    return json.loads(p.read_text(encoding="utf-8"))
 
 
 def check_hard_leak_tokens(text: str) -> list[str]:
@@ -102,21 +57,8 @@ def check_writing_leak(text: str) -> list[str]:
     return found
 
 
-def grade_doc(structural_issues: list[str], cosmetic_issues: list[str],
-              seg_count: int, missing_critical: list[str]) -> tuple[str, str]:
-    """Return (grade, sub_grade) where sub_grade adds context."""
-    if seg_count == 0 or len(missing_critical) >= 3:
-        return ("FAIL", "")
-    if missing_critical or seg_count < 8 or seg_count > 12 or structural_issues:
-        return ("WARN", "structural")
-    if cosmetic_issues:
-        return ("PASS", "tail-bleed")
-    return ("PASS", "clean")
-
-
 def run(out_dir: Path) -> None:
     rows = collect_rows(out_dir)
-    segments_dir = out_dir / "segments"
     report_path = out_dir / "segment_quality_report.md"
 
     # Group by doc
@@ -128,106 +70,7 @@ def run(out_dir: Path) -> None:
             doc_order.append(doc)
         by_doc[doc].append(r)
 
-    # --- per-doc analysis ---
-    doc_results: list[dict] = []
-    for doc in doc_order:
-        segs = by_doc[doc]
-        sections = [s["section"] for s in segs]
-        section_set = set(sections)
-        missing = [s for s in EXPECTED_SECTIONS if s not in section_set]
-        missing_critical = [s for s in CRITICAL_SECTIONS if s not in section_set]
-        dup_sections = [s for s, c in Counter(sections).items() if c > 1]
-
-        structural_issues: list[str] = []
-        cosmetic_issues: list[str] = []
-        seg_details: list[dict] = []
-
-        for s in segs:
-            char_count = int(s.get("char_count", 0))
-            seg_structural: list[str] = []
-            seg_cosmetic: list[str] = []
-
-            if char_count < 100:
-                seg_structural.append(f"文本过短 ({char_count} 字符)")
-            if char_count > 12000:
-                seg_structural.append(f"文本过长 ({char_count} 字符) — 可能题型粘连")
-
-            # Load segment text for deeper checks
-            seg_path = s.get("segment_path", "")
-            if seg_path:
-                try:
-                    seg_data = load_segment(seg_path)
-                    qtext = seg_data.get("question_text", "")
-                    section = s.get("section", "")
-
-                    leaks = check_hard_leak_tokens(qtext)
-                    if leaks and section in {"continuation_writing", "practical_writing"}:
-                        # Writing segment leaking into answer/transcript is cosmetic
-                        # (known trim_answer_tail_from_text limitation)
-                        labels = ", ".join(leaks[:3])
-                        seg_cosmetic.append(f"尾部粘连答案/录音区: {labels}")
-                    elif leaks:
-                        labels = ", ".join(leaks[:3])
-                        seg_structural.append(f"疑似含答案/录音边界词: {labels}")
-
-                    soft_layout = check_soft_layout_tokens(qtext)
-                    if soft_layout:
-                        labels = ", ".join(soft_layout[:3])
-                        seg_cosmetic.append(f"含试卷版面提示: {labels}")
-
-                    # Writing-specific checks
-                    if section in {"practical_writing", "continuation_writing"}:
-                        wleaks = check_writing_leak(qtext)
-                        if wleaks:
-                            labels = ", ".join(wleaks[:3])
-                            seg_cosmetic.append(f"含答案范文/解析标记: {labels}")
-                except Exception:
-                    seg_structural.append("segment JSON 读取失败")
-
-            if seg_structural:
-                structural_issues.extend(seg_structural)
-            if seg_cosmetic:
-                cosmetic_issues.extend(seg_cosmetic)
-
-            seg_details.append({
-                "section": s["section"],
-                "display": SECTION_DISPLAY.get(s["section"], s["section"]),
-                "label": s.get("item_label", ""),
-                "chars": char_count,
-                "path": seg_path,
-                "structural": seg_structural,
-                "cosmetic": seg_cosmetic,
-            })
-
-        if len(segs) < 8:
-            structural_issues.append(f"segment 数量偏少 ({len(segs)} 个)")
-        if len(segs) > 12:
-            structural_issues.append(f"segment 数量偏多 ({len(segs)} 个)")
-        if missing:
-            structural_issues.append(f"缺少题型: {', '.join(missing)}")
-        if dup_sections:
-            structural_issues.append(f"重复题型: {', '.join(dup_sections)}")
-
-        # Check for no writing sections
-        has_writing = bool({"practical_writing", "continuation_writing"} & section_set)
-        if not has_writing:
-            structural_issues.append("缺少所有写作题型")
-
-        grade, sub_grade = grade_doc(structural_issues, cosmetic_issues, len(segs), missing_critical)
-
-        doc_results.append({
-            "doc": doc,
-            "seg_count": len(segs),
-            "sections": sections,
-            "missing": missing,
-            "missing_critical": missing_critical,
-            "duplicates": dup_sections,
-            "structural_issues": structural_issues,
-            "cosmetic_issues": cosmetic_issues,
-            "grade": grade,
-            "sub_grade": sub_grade,
-            "details": seg_details,
-        })
+    doc_results = [evaluate_document(doc, by_doc[doc]) for doc in doc_order]
 
     # --- build report ---
     lines: list[str] = []

@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.2.0 — 2026-07-12
+
+### Added
+
+- Structural segmentation quality gate with rough-model fallback for affected papers only.
+- Shared `segment_quality.py` evaluator and persisted `segment_fallback_report.json` audit trail.
+- Professional education-blue GUI with Basic progress/ETA and fixed auto-scrolling logs for Advanced/Debug modes.
+- Independent, confirmed “clear input” and “clear output” actions with project-path protection.
+- Three committed A4 Pandoc reference DOCX templates for student, teacher, and answer outputs.
+- Zero-dependency `tests/run_tests.py` that actually executes every plain `test_*` function.
+
+### Changed
+
+- Segment, score, and enrichment worker defaults are all 16 in GUI and CLI.
+- Full GUI workflow now runs explicit ordered stages instead of hiding them inside one `stage1` subprocess.
+- Exported Word files use clear Chinese names and validate A4, headers, footers, and East Asian font mappings.
+- Assembled teacher Markdown uses semantic headings for vocabulary, grammar, long sentences, and teaching notes.
+
+### Verified
+
+- 61 regression tests passed.
+- Three Word outputs rendered as A4 PDFs with readable Chinese, stable spacing, section hierarchy, and page numbers.
+
 ## v0.1.0 — 2026-06-04
 
 First stable release of the Gaokao English Docx Pipeline.
