@@ -98,7 +98,7 @@ def test_unlocatable_text_reports_no_range_rather_than_guessing():
         assert db.find_block_range(doc, "") == []
 
 
-def test_fallback_failure_keeps_the_local_segmentation():
+def test_repair_failure_keeps_the_local_segmentation():
     # The local pass already produced usable, cloneable segments. A failing model
     # call must not take the run down with it.
     with tempfile.TemporaryDirectory() as tmp:
@@ -110,33 +110,65 @@ def test_fallback_failure_keeps_the_local_segmentation():
         args = pipeline.parse_args([str(indir), "--out", str(tmp / "out"), "--segment-input", "local"])
         args.api_key = "test-key"
 
-        original = pipeline.segment_docx_file
-        calls = {"n": 0}
+        attempts = {"n": 0}
 
-        def flaky(docx, a, out_dir):
-            # rough mode blows up the way the real run did; local mode still works
-            if getattr(a, "segment_input", "local") == "rough":
-                calls["n"] += 1
-                raise RuntimeError("Segment JSON parse failed for paper.docx / 读后续写")
-            return original(docx, a, out_dir)
+        def exploding_locate(doc, segments, missing, ask, log=print):
+            attempts["n"] += 1
+            raise RuntimeError("model call blew up")
 
-        forced = pipeline.evaluate_document
+        grade = pipeline.evaluate_document
 
         def always_warn(doc, rows):
-            result = forced(doc, rows)
+            result = grade(doc, rows)
             result["needs_model_fallback"] = True
             result["grade"] = "WARN"
+            result["missing"] = ["gap_filling"]
             result["structural_issues"] = ["forced"]
             return result
 
-        pipeline.segment_docx_file = flaky
+        original_locate = pipeline.locate_missing_sections
+        pipeline.locate_missing_sections = exploding_locate
         pipeline.evaluate_document = always_warn
         try:
             rows = pipeline.run_segment(args)  # must NOT raise
         finally:
-            pipeline.segment_docx_file = original
-            pipeline.evaluate_document = forced
+            pipeline.locate_missing_sections = original_locate
+            pipeline.evaluate_document = grade
 
-        assert calls["n"] >= 1, "the fallback should have been attempted"
-        assert rows, "the local segmentation must survive the failed fallback"
+        assert attempts["n"] >= 1, "repair should have been attempted"
+        assert rows, "the local segmentation must survive the failed repair"
         assert all(r.get("segment_path") for r in rows)
+
+
+def test_a_remaining_warning_does_not_stop_the_run():
+    # A WARN means "worth a look", not "unusable": the questions were still cut
+    # from the original and still clone. Killing the run there wasted a full pass.
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        indir = tmp / "in"
+        indir.mkdir()
+        _fixture(indir / "paper.docx")
+
+        args = pipeline.parse_args([str(indir), "--out", str(tmp / "out"), "--segment-input", "local"])
+        args.api_key = "test-key"
+
+        grade = pipeline.evaluate_document
+
+        def stubborn_warn(doc, rows):
+            result = grade(doc, rows)
+            result["needs_model_fallback"] = True
+            result["grade"] = "WARN"
+            result["missing"] = ["gap_filling"]
+            result["structural_issues"] = ["still not perfect"]
+            return result
+
+        original_locate = pipeline.locate_missing_sections
+        pipeline.locate_missing_sections = lambda *a, **k: []  # model finds nothing
+        pipeline.evaluate_document = stubborn_warn
+        try:
+            rows = pipeline.run_segment(args)  # must NOT raise
+        finally:
+            pipeline.locate_missing_sections = original_locate
+            pipeline.evaluate_document = grade
+
+        assert rows, "a WARN must not throw the segmentation away"

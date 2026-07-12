@@ -114,20 +114,52 @@ def test_run_segment_replaces_only_abnormal_paper():
                 })
             return rows
 
+        # The repair step asks the model for a boundary; stub it so the test stays
+        # about *which* papers get repaired, not about the model call itself.
+        repaired: list[str] = []
+
+        def fake_locate(doc, segments, missing, ask, log=print):
+            repaired.append(missing[0] if missing else "")
+            return [(0, "gap_filling", "七选五")]
+
+        def fake_segment_with_extra(docx: Path, args, target: Path, extra_starts=None):
+            if extra_starts:
+                calls.append((docx.name, "repair"))
+                rows = fake_segment(docx, args, target)
+                # the recovered section is now present
+                rows.append({
+                    "item_id": f"{docx.stem}-gap_filling-99", "source_doc": docx.name,
+                    "section": "gap_filling", "display_section": "七选五", "item_label": "七选五",
+                    "title": "七选五", "char_count": 300, "answer_count": 5, "confidence": .9,
+                    "rough_unit": "local", "segment_path": str(target / "segments" / f"{docx.stem}-gap.json"),
+                })
+                (target / "segments").mkdir(parents=True, exist_ok=True)
+                (target / "segments" / f"{docx.stem}-gap.json").write_text("{}", encoding="utf-8")
+                return rows
+            return fake_segment(docx, args, target)
+
         original = pipeline.segment_docx_file
-        pipeline.segment_docx_file = fake_segment
+        original_locate = pipeline.locate_missing_sections
+        original_read = pipeline.read_docx
+        pipeline.segment_docx_file = fake_segment_with_extra
+        pipeline.locate_missing_sections = fake_locate
+        pipeline.read_docx = lambda p: object()  # repair only needs it to hand to locate
         try:
             args = parse_args([str(input_dir), "--out", str(out_dir), "--mode", "segment"])
             args.api_key = "test-key"
             rows = pipeline.run_segment(args)
         finally:
             pipeline.segment_docx_file = original
+            pipeline.locate_missing_sections = original_locate
+            pipeline.read_docx = original_read
 
-        assert ("bad.docx", "rough") in calls
-        assert ("good.docx", "rough") not in calls
-        assert len(rows) == 18
+        assert ("bad.docx", "repair") in calls, "the mis-split paper must be repaired"
+        assert ("good.docx", "repair") not in calls, "a healthy paper must not be touched"
+        assert repaired == ["gap_filling"], "only the section that went missing is asked about"
+
         report = json.loads((out_dir / "segment_fallback_report.json").read_text(encoding="utf-8"))
         assert len(report) == 1 and report[0]["source_doc"] == "bad.docx"
+        assert report[0]["fallback_mode"] == "boundary"
         assert report[0]["final_grade"] == "PASS"
 
 

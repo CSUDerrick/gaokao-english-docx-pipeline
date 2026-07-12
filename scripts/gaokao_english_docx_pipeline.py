@@ -41,6 +41,7 @@ from xml.etree import ElementTree as ET
 
 from docx_blocks import DocxDoc, find_block_range, read_docx
 from segment_quality import evaluate_document
+from segment_repair import locate_missing_sections
 
 
 NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
@@ -785,7 +786,20 @@ def trim_answer_tail_with_offset(text: str) -> tuple[str, int]:
     return raw.strip(), lead
 
 
-def local_segment_paper(source_doc: str, text: str, doc: DocxDoc | None = None) -> list[dict]:
+def local_segment_paper(
+    source_doc: str,
+    text: str,
+    doc: DocxDoc | None = None,
+    extra_starts: list[tuple[int, str, str]] | None = None,
+) -> list[dict]:
+    """Split a paper into questions.
+
+    ``extra_starts`` are section boundaries the keyword rules missed, recovered by
+    :mod:`segment_repair` asking the model for a paragraph number. They are fed
+    back in here — rather than being patched on afterwards — so the recovered
+    section gets its answer key and block range by exactly the same code as every
+    other section.
+    """
     body, body_offset = trim_answer_tail_with_offset(text)
     answer_tail = extract_answer_tail(text, max_chars=30000)
     # Use full-text scan for robust answer extraction (handles table format,
@@ -831,6 +845,13 @@ def local_segment_paper(source_doc: str, text: str, doc: DocxDoc | None = None) 
     if continuation_idx is None and writing_idx is not None:
         continuation_idx = find_line_index(lines, r"第二节.*满分\s*25\s*分", (practical_idx or writing_idx) + 1)
     add_start("continuation_writing", "读后续写", continuation_idx)
+
+    for pos, section, label in extra_starts or []:
+        # char offsets from the repair step index the full text; the segmenter
+        # measures against the answer-trimmed body.
+        adjusted = pos - body_offset
+        if 0 <= adjusted < len(body):
+            starts.append((adjusted, section, label))
 
     starts = sorted({(pos, section): (pos, section, label) for pos, section, label in starts}.values(), key=lambda x: x[0])
     segments: list[dict] = []
@@ -1752,7 +1773,12 @@ def rough_segment_units(source_doc: str, text: str, args: argparse.Namespace) ->
     return units
 
 
-def segment_docx_file(docx: Path, args: argparse.Namespace, out_dir: Path) -> list[dict]:
+def segment_docx_file(
+    docx: Path,
+    args: argparse.Namespace,
+    out_dir: Path,
+    extra_starts: list[tuple[int, str, str]] | None = None,
+) -> list[dict]:
     extracted_dir = out_dir / "extracted_text"
     segments_dir = out_dir / "segments"
     rough_dir = out_dir / "rough_segments"
@@ -1767,7 +1793,7 @@ def segment_docx_file(docx: Path, args: argparse.Namespace, out_dir: Path) -> li
     text_path.write_text(text, encoding="utf-8")
 
     if args.segment_input == "local":
-        segments = local_segment_paper(source_doc, text, doc)
+        segments = local_segment_paper(source_doc, text, doc, extra_starts)
         write_json(rough_dir / f"{safe_stem(source_doc)}__local_segments.json", segments)
         counters: dict[str, int] = {}
         rows: list[dict] = []
@@ -1937,59 +1963,74 @@ def run_segment(args: argparse.Namespace) -> list[dict]:
                     "Local segmentation produced structural WARN/FAIL and model fallback requires an API key. "
                     f"Problems: {summary}. Set {args.api_key_env}, or use --no-segment-warning-fallback for local diagnostics only."
                 )
-            log(args, f"Structural segmentation warning in {len(needs_fallback)} paper(s); retrying only those papers with model rough segmentation.")
+            log(args, f"{len(needs_fallback)} 份试卷本地切分有结构疑点；只就疑点处向模型询问边界，正文仍从原卷截取。")
             docx_by_name = {path.name: path for path in docx_files}
-            fallback_args = argparse.Namespace(**vars(args))
-            fallback_args.segment_input = "rough"
             replacement_rows: dict[str, list[dict]] = {}
+
+            def repair_paper(doc_name: str) -> list[dict]:
+                """Ask the model only where the missing section starts, then re-cut locally."""
+                path = docx_by_name[doc_name]
+                parsed = read_docx(path)
+                segments = [read_json(Path(r["segment_path"])) for r in rows_by_doc[doc_name]]
+                missing = needs_fallback[doc_name].get("missing") or []
+                if not missing:
+                    return []
+
+                def ask(prompt: str) -> str:
+                    return call_stage_model(
+                        args, prompt,
+                        model=args.segment_model,
+                        reasoning_effort=args.segment_reasoning_effort,
+                        thinking=args.segment_thinking,
+                        max_tokens=200,  # the reply is a single number
+                    ).content
+
+                extra = locate_missing_sections(
+                    parsed, segments, missing, ask, log=lambda m: log(args, m)
+                )
+                if not extra:
+                    return []
+                return segment_docx_file(path, args, out_dir, extra_starts=extra)
+
             with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.segment_workers)) as executor:
-                future_map = {
-                    executor.submit(segment_docx_file, docx_by_name[doc], fallback_args, out_dir): doc
-                    for doc in needs_fallback
-                }
+                future_map = {executor.submit(repair_paper, doc): doc for doc in needs_fallback}
                 for future in concurrent.futures.as_completed(future_map):
                     doc = future_map[future]
                     try:
-                        model_rows = future.result()
+                        repaired = future.result()
                     except Exception as exc:  # noqa: BLE001
-                        # Re-segmenting is an attempt to *improve* a paper the
-                        # local pass already handled. If the model call fails,
-                        # keep the local segmentation rather than throwing away
-                        # the whole run — the local result is usable, and it is
-                        # the one that carries source_blocks for cloning.
-                        log(args, f"  WARNING: model re-segmentation failed for {doc} ({type(exc).__name__}: {exc}).")
-                        log(args, f"           keeping the local segmentation for {doc}; check its quality report.")
-                        # The failed pass may have overwritten some of this
-                        # paper's segment files before dying, so rebuild them.
-                        local_again = argparse.Namespace(**vars(args))
-                        local_again.segment_input = "local"
-                        rows_by_doc[doc] = segment_docx_file(docx_by_name[doc], local_again, out_dir)
+                        # Repair is an attempt to *improve* a paper the local pass
+                        # already handled. Its failure must not take the run down.
+                        log(args, f"  边界修复失败（{doc}）：{type(exc).__name__}: {exc}")
+                        log(args, f"  保留 {doc} 的本地切分结果。")
+                        repaired = []
+
+                    if not repaired:
                         fallback_records.append({
                             "source_doc": doc,
                             "local_grade": needs_fallback[doc]["grade"],
                             "local_issues": needs_fallback[doc]["structural_issues"],
-                            "fallback_mode": "rough",
+                            "fallback_mode": "boundary",
                             "model": args.segment_model,
-                            "fallback_error": f"{type(exc).__name__}: {exc}",
                             "final_grade": needs_fallback[doc]["grade"],
                             "final_issues": needs_fallback[doc]["structural_issues"],
                             "final_segment_count": len(rows_by_doc.get(doc, [])),
                         })
                         continue
 
-                    model_quality = evaluate_document(doc, model_rows)
-                    replacement_rows[doc] = model_rows
+                    quality = evaluate_document(doc, repaired)
+                    replacement_rows[doc] = repaired
                     fallback_records.append({
                         "source_doc": doc,
                         "local_grade": needs_fallback[doc]["grade"],
                         "local_issues": needs_fallback[doc]["structural_issues"],
-                        "fallback_mode": "rough",
+                        "fallback_mode": "boundary",
                         "model": args.segment_model,
-                        "final_grade": model_quality["grade"],
-                        "final_issues": model_quality["structural_issues"],
-                        "final_segment_count": len(model_rows),
+                        "final_grade": quality["grade"],
+                        "final_issues": quality["structural_issues"],
+                        "final_segment_count": len(repaired),
                     })
-                    log(args, f"  model re-segmented {doc}: {len(model_rows)} item(s), grade={model_quality['grade']}.")
+                    log(args, f"  边界修复后 {doc}：{len(repaired)} 道题，评级={quality['grade']}。")
 
             final_rows: list[dict] = []
             unresolved: list[dict] = []
@@ -2009,12 +2050,19 @@ def run_segment(args: argparse.Namespace) -> list[dict]:
                     unresolved.append(final_quality)
             rows = final_rows
             write_json(fallback_report_path, fallback_records)
-            if unresolved:
+
+            # A remaining WARN is advisory: the questions were still cut from the
+            # original paper and still carry their block ranges, so they score and
+            # clone fine — the teacher just gets told which paper to eyeball. Only
+            # a FAIL (nothing usable came out) is worth stopping for.
+            failed = [item for item in unresolved if item["grade"] == "FAIL"]
+            if failed:
                 summary = "; ".join(
-                    f"{item['doc']}: {', '.join(item['structural_issues'][:2])}"
-                    for item in unresolved
+                    f"{item['doc']}: {', '.join(item['structural_issues'][:2])}" for item in failed
                 )
-                raise SystemExit(f"Model segmentation still has structural WARN/FAIL; scoring stopped. {summary}")
+                raise SystemExit(f"切分失败，已停止以免浪费 API 额度。{summary}")
+            for item in unresolved:
+                log(args, f"  注意：{item['doc']} 仍有结构疑点（{', '.join(item['structural_issues'][:2])}），已继续处理，建议人工抽查。")
 
     rows.sort(key=lambda r: (r["source_doc"], section_order(r["section"]), r["item_id"]))
     segment_index = out_dir / "segment_index.jsonl"
