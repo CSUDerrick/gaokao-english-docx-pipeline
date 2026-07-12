@@ -149,3 +149,33 @@ def read_docx(path: Path) -> DocxDoc:
 def extract_docx_text(path: Path) -> str:
     """Backwards-compatible flat-text reader."""
     return read_docx(path).text
+
+
+def find_block_range(doc: DocxDoc, question_text: str, min_ratio: float = 0.5) -> list[int]:
+    """Locate a model-produced question back in the source blocks.
+
+    AI segmentation re-emits the question text rather than reporting offsets, so
+    there is no range to record — and without one the export cannot clone the
+    original paragraphs and would silently drop the question. Anchor it back by
+    matching whole lines, which the model reproduces verbatim far more reliably
+    than it reproduces character offsets.
+
+    Returns ``[]`` when too little of the text can be located, so the caller can
+    fall back rather than clone the wrong paragraphs.
+    """
+    wanted = [line.strip() for line in (question_text or "").split("\n") if len(line.strip()) >= 8]
+    if not wanted:
+        return []
+
+    by_text: dict[str, list[int]] = {}
+    for block in doc.blocks:
+        by_text.setdefault(block.text.strip(), []).append(block.body_index)
+
+    hits: list[int] = []
+    for line in wanted:
+        if line in by_text:
+            hits.extend(by_text[line])
+
+    if len(hits) < max(2, len(wanted) * min_ratio):
+        return []
+    return [min(hits), max(hits) + 1]

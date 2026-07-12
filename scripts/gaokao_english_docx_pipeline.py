@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import contextlib
 import csv
 import json
 import os
@@ -38,7 +39,7 @@ from pathlib import Path
 from typing import Iterable
 from xml.etree import ElementTree as ET
 
-from docx_blocks import DocxDoc, read_docx
+from docx_blocks import DocxDoc, find_block_range, read_docx
 from segment_quality import evaluate_document
 
 
@@ -1293,7 +1294,57 @@ def parse_model_json(content: str) -> dict | str:
                 return json.loads(match.group(0))
             except json.JSONDecodeError:
                 pass
+    salvaged = salvage_truncated_json(content)
+    if salvaged is not None:
+        return salvaged
     return content
+
+
+def salvage_truncated_json(content: str) -> dict | None:
+    """Recover the complete objects from a response that hit the token cap.
+
+    A long paper can push the model past ``--segment-max-tokens``, cutting the
+    reply mid-string. Everything before the cut is still perfectly good, so keep
+    the segments that did finish rather than discarding the whole call.
+    """
+    start = content.find("{")
+    if start == -1 or '"segments"' not in content:
+        return None
+
+    items = content[content.find("[", start) + 1 :]
+    segments: list[dict] = []
+    depth = 0
+    begin = None
+    in_string = False
+    escaped = False
+
+    for i, ch in enumerate(items):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            if depth == 0:
+                begin = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and begin is not None:
+                with contextlib.suppress(json.JSONDecodeError):
+                    segments.append(json.loads(items[begin : i + 1]))
+                begin = None
+
+    if not segments:
+        return None
+
+    doc_match = re.search(r'"source_doc"\s*:\s*"([^"]*)"', content)
+    return {"source_doc": doc_match.group(1) if doc_match else "", "segments": segments, "_truncated": True}
 
 
 def build_final_selection_prompt(analyses_path: Path | None = None) -> str:
@@ -1789,6 +1840,14 @@ def segment_docx_file(docx: Path, args: argparse.Namespace, out_dir: Path) -> li
             counters[section_key] = counters.get(section_key, 0) + 1
             item_id = f"{safe_stem(source_doc)}__{section_key}__{counters[section_key]:02d}"
             item_label = str(segment.get("item_label") or f"{section_display(section_key)}{counters[section_key]}")
+            # AI segmentation re-emits the text instead of reporting offsets, so
+            # anchor it back onto the source paragraphs — without a block range
+            # the export cannot clone the original formatting and would drop the
+            # question from the Word file entirely.
+            source_blocks = find_block_range(doc, str(segment.get("question_text") or ""))
+            if not source_blocks:
+                log(args, f"  WARNING: could not locate {item_label} in {source_doc}; it will keep AI text but lose original formatting.")
+
             segment.update(
                 {
                     "item_id": item_id,
@@ -1799,6 +1858,8 @@ def segment_docx_file(docx: Path, args: argparse.Namespace, out_dir: Path) -> li
                     "rough_unit": unit["label"],
                     "rough_unit_index": unit_idx,
                     "prompt_version": SEGMENT_PROMPT_VERSION,
+                    "source_path": str(docx),
+                    "source_blocks": source_blocks,
                 }
             )
             segment_path = segments_dir / f"{safe_filename(item_id)}.json"
@@ -1888,7 +1949,34 @@ def run_segment(args: argparse.Namespace) -> list[dict]:
                 }
                 for future in concurrent.futures.as_completed(future_map):
                     doc = future_map[future]
-                    model_rows = future.result()
+                    try:
+                        model_rows = future.result()
+                    except Exception as exc:  # noqa: BLE001
+                        # Re-segmenting is an attempt to *improve* a paper the
+                        # local pass already handled. If the model call fails,
+                        # keep the local segmentation rather than throwing away
+                        # the whole run — the local result is usable, and it is
+                        # the one that carries source_blocks for cloning.
+                        log(args, f"  WARNING: model re-segmentation failed for {doc} ({type(exc).__name__}: {exc}).")
+                        log(args, f"           keeping the local segmentation for {doc}; check its quality report.")
+                        # The failed pass may have overwritten some of this
+                        # paper's segment files before dying, so rebuild them.
+                        local_again = argparse.Namespace(**vars(args))
+                        local_again.segment_input = "local"
+                        rows_by_doc[doc] = segment_docx_file(docx_by_name[doc], local_again, out_dir)
+                        fallback_records.append({
+                            "source_doc": doc,
+                            "local_grade": needs_fallback[doc]["grade"],
+                            "local_issues": needs_fallback[doc]["structural_issues"],
+                            "fallback_mode": "rough",
+                            "model": args.segment_model,
+                            "fallback_error": f"{type(exc).__name__}: {exc}",
+                            "final_grade": needs_fallback[doc]["grade"],
+                            "final_issues": needs_fallback[doc]["structural_issues"],
+                            "final_segment_count": len(rows_by_doc.get(doc, [])),
+                        })
+                        continue
+
                     model_quality = evaluate_document(doc, model_rows)
                     replacement_rows[doc] = model_rows
                     fallback_records.append({
@@ -3175,7 +3263,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--timeout", type=int, default=120)
     parser.add_argument("--max-retries", type=int, default=8, help="Max retries for retryable API errors such as 429 rate limits.")
     parser.add_argument("--max-tokens", type=int, default=6000, help="Output token cap for legacy analyze/final modes.")
-    parser.add_argument("--segment-max-tokens", type=int, default=4000, help="Output token cap for AI segmentation. Ignored by local segmentation.")
+    parser.add_argument("--segment-max-tokens", type=int, default=16000, help="Output token cap for AI segmentation. Ignored by local segmentation.")
     parser.add_argument("--score-max-tokens", type=int, default=1200, help="Output token cap for each lightweight score call.")
     parser.add_argument("--review-max-tokens", type=int, default=2500, help="Output token cap for each review-select call.")
     parser.add_argument("--enrich-max-tokens", type=int, default=3500, help="Output token cap for each selected-item enrichment call.")

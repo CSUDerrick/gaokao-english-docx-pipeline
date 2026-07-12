@@ -36,6 +36,8 @@ rm -rf build dist
   --add-data "assets:assets" \
   --add-data "config:config" \
   --add-data "scripts:scripts" \
+  --paths app \
+  --hidden-import settings \
   --paths scripts \
   --hidden-import docx_blocks \
   --hidden-import docx_splice \

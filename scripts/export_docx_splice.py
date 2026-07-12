@@ -97,6 +97,33 @@ def _answers_doc(rows: list[dict], out: Path, pipeline) -> Path:
     return out
 
 
+def _plain_doc(heading: str, text: str, notes: list[tuple[str, str]], out: Path) -> Path:
+    """Fallback for a question that could not be traced back to its source.
+
+    Loses the original typesetting, but keeps the question in the paper.
+    """
+    from docx import Document
+
+    template = TEMPLATE_DIR / "student_reference.docx"
+    doc = Document(str(template)) if template.exists() else Document()
+    for para in list(doc.paragraphs):
+        para._element.getparent().remove(para._element)
+
+    ds.ensure_note_styles(doc)
+    doc.add_paragraph(ds.sanitize(heading), style=ds.NOTE_HEADING)
+    for line in ds.sanitize(text).split("\n"):
+        if line.strip():
+            doc.add_paragraph(line, style=ds.NOTE_BODY)
+    for style_name, body in notes:
+        for line in ds.sanitize(body).split("\n"):
+            if line.strip():
+                doc.add_paragraph(line, style=style_name)
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    doc.save(str(out))
+    return out
+
+
 def export_selected(out_dir: Path, pipeline, log=print) -> list[Path]:
     selection = out_dir / "selected_items.json"
     if not selection.exists():
@@ -125,16 +152,24 @@ def export_selected(out_dir: Path, pipeline, log=print) -> list[Path]:
             segment = _load(Path(row["segment_path"]))
             src = segment.get("source_path")
             blocks = segment.get("source_blocks") or []
-            if not src or len(blocks) != 2 or not Path(src).exists():
-                # AI-segmented or OCR items carry no pointer into an original
-                # docx, so there is nothing to clone. Skip loudly rather than
-                # silently dropping the question from the paper.
+            heading = f"{row.get('item_label', '')}｜来源：{row.get('source_doc', '')}"
+            cloneable = bool(src) and len(blocks) == 2 and Path(src).exists()
+
+            if not cloneable:
+                # No pointer back into an original docx (AI-segmented text the
+                # anchor could not place). Render the text we do have rather than
+                # dropping the question — a missing question is far worse than an
+                # unstyled one.
                 skipped.append(str(row.get("item_id")))
+                text = segment.get("question_text") or ""
+                sp = _plain_doc(heading, text, [], tmp / f"s{n:03d}.docx")
+                tp = _plain_doc(heading, text, _notes_for(row, pipeline), tmp / f"t{n:03d}.docx")
+                student_parts.append(sp)
+                teacher_parts.append(tp)
                 continue
 
             lo, hi = blocks
             indices = list(range(lo, hi))
-            heading = f"{row.get('item_label', '')}｜来源：{row.get('source_doc', '')}"
 
             sp = tmp / f"s{n:03d}.docx"
             ds.clone_subset(Path(src), indices, sp)
@@ -147,9 +182,9 @@ def export_selected(out_dir: Path, pipeline, log=print) -> list[Path]:
             teacher_parts.append(tp)
 
         if skipped:
-            log(f"  WARNING: {len(skipped)} item(s) had no source_blocks and were skipped: {', '.join(skipped)}")
+            log(f"  WARNING: {len(skipped)} 道题无法定位到原卷段落，已按纯文本导出（格式需手动调整）：{', '.join(skipped)}")
         if not student_parts:
-            raise SystemExit("No selected item could be traced back to its source docx; nothing to export.")
+            raise SystemExit("No selected item produced any content; nothing to export.")
 
         created: list[Path] = []
         for parts, name, title in (
