@@ -7,6 +7,7 @@ quality report, and test suite all grade segmentation with the same rules.
 from __future__ import annotations
 
 import json
+import re
 from collections import Counter
 from pathlib import Path
 
@@ -39,10 +40,28 @@ HARD_LEAK_TOKENS = [
 SOFT_LAYOUT_TOKENS = ["答题卡", "考号", "准考证号"]
 
 WRITING_LEAK_TOKENS = [
-    "One possible version", "Possible version", "参考范文", "范文",
-    "评分标准", "评分原则", "写作要点", "内容要点",
-    "【导语】", "【详解】", "【点睛】", "词汇积累", "句式拓展",
+    "One possible version", "Possible version", "参考范文",
+    "评分标准", "评分原则",
+    "【导语】", "【详解】", "【点睛】",
 ]
+
+# An answer run such as "21—23. CBC": a question range followed by exactly one
+# letter per question. Nothing in a question body looks like this.
+_ANSWER_RUN = re.compile(r"(?m)^\s*(\d{1,2})\s*[-—~－–]+\s*(\d{1,2})\s*[.．、:：]?\s*([A-G]{2,})\b")
+_PER_QUESTION_EXPLANATION = re.compile(r"【\d+题详解】")
+
+
+def answer_leaks(question_text: str) -> list[str]:
+    """Name the answer-key evidence found inside a question body, if any."""
+    found: list[str] = []
+    for match in _ANSWER_RUN.finditer(question_text):
+        first, last, letters = int(match.group(1)), int(match.group(2)), match.group(3)
+        if last > first and len(letters) == last - first + 1:
+            found.append(f"答案键 {match.group(0).strip()}")
+            break
+    if _PER_QUESTION_EXPLANATION.search(question_text):
+        found.append("逐题解析")
+    return found
 
 
 def load_segment(seg_path: str | Path) -> dict:
@@ -96,19 +115,20 @@ def evaluate_document(doc: str, segs: list[dict]) -> dict:
             try:
                 segment = load_segment(seg_path)
                 question_text = str(segment.get("question_text") or "")
-                section = str(row.get("section") or "")
+                # An answer inside a question body is never cosmetic: it is how
+                # answers reached the *student* paper. The writing sections used
+                # to be exempted here, which is exactly where the model essays
+                # leaked through — so there is no exemption any more.
+                leaks = answer_leaks(question_text)
                 hard = [token for token in HARD_LEAK_TOKENS if token in question_text]
-                if hard and section in {"continuation_writing", "practical_writing"}:
-                    seg_cosmetic.append(f"尾部粘连答案/录音区: {', '.join(hard[:3])}")
-                elif hard:
-                    seg_structural.append(f"疑似含答案/录音边界词: {', '.join(hard[:3])}")
+                if leaks or hard:
+                    seg_structural.append(f"题干内含答案/解析: {', '.join((leaks + hard)[:3])}")
                 soft = [token for token in SOFT_LAYOUT_TOKENS if token in question_text]
                 if soft:
                     seg_cosmetic.append(f"含试卷版面提示: {', '.join(soft[:3])}")
-                if section in {"practical_writing", "continuation_writing"}:
-                    writing = [token for token in WRITING_LEAK_TOKENS if token in question_text]
-                    if writing:
-                        seg_cosmetic.append(f"含答案范文/解析标记: {', '.join(writing[:3])}")
+                writing = [token for token in WRITING_LEAK_TOKENS if token in question_text]
+                if writing:
+                    seg_structural.append(f"题干内含范文/解析标记: {', '.join(writing[:3])}")
             except Exception:
                 seg_structural.append("segment JSON 读取失败")
 

@@ -2,7 +2,12 @@
 
 A real paper headed its 七选五 with only ``第二节（共5小题...）`` — no "七选五", no
 "多余选项" — so the keyword rules missed it and 阅读D swallowed it (4,722 chars vs
-~2,800 for its neighbours).
+~2,800 for its neighbours). That particular paper is now handled locally, by
+matching its mark scheme (5 questions, 12.5 marks, unique in a paper) — see
+``test_mark_scheme_heading_needs_no_repair``.
+
+Repair still exists for papers where no rule can work at all, and these tests use
+a 七选五 headed by a bare 第二节 to exercise it.
 
 The old fallback handed the whole paper to the model and asked it to re-emit every
 question. It came back with 44 items, several 37 characters long, none of which
@@ -33,8 +38,14 @@ sys.modules["pipeline_repair"] = pipeline
 _spec.loader.exec_module(pipeline)
 
 
-def _paper(path: Path) -> Path:
-    """A paper whose 七选五 is labelled only as 第二节 — the case that broke."""
+def _paper(path: Path, gap_heading: str = "第二节") -> Path:
+    """A paper whose 七选五 carries no recognisable name.
+
+    ``gap_heading`` defaults to a bare 第二节: no "七选五", no "多余选项", and no
+    mark scheme either, so no local rule can find it and the model has to be
+    asked where the boundary is. Pass the 江苏 heading to get the paper that the
+    local rules *do* handle now (see test_mark_scheme_heading_needs_no_repair).
+    """
     from docx import Document
 
     doc = Document()
@@ -51,8 +62,8 @@ def _paper(path: Path) -> Path:
         doc.add_paragraph(f"{n}. Question about passage D here?")
         doc.add_paragraph("A. one B. two C. three D. four")
 
-    # 七选五 — headed only by 第二节, which the keyword rules do not recognise
-    doc.add_paragraph("第二节（共5小题；每小题2.5分，满分12.5分）")
+    # 七选五 — headed only by `gap_heading`
+    doc.add_paragraph(gap_heading)
     doc.add_paragraph("As a child growing up there are many different paths available. ____36____")
     doc.add_paragraph("I was always looking for pennies. ____37____ My father passed away. ____38____")
     doc.add_paragraph("Later I told my neighbor the story. ____39____ How things change. ____40____")
@@ -69,6 +80,25 @@ def _paper(path: Path) -> Path:
     doc.add_paragraph("36-40. ABGCF")
     doc.save(str(path))
     return path
+
+
+def test_mark_scheme_heading_needs_no_repair():
+    """The 江苏 paper: 七选五 named nowhere, but its mark scheme gives it away.
+
+    This used to cost a model round-trip on every run. A section worth 12.5 marks
+    over 5 questions is 七选五 and nothing else, so the rules can place it locally.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        src = _paper(Path(tmp) / "a.docx", gap_heading="第二节（共5小题；每小题2.5分，满分12.5分）")
+        doc = db.read_docx(src)
+        segments = pipeline.local_segment_paper(src.name, doc.text, doc)
+
+        gap = [s for s in segments if s["section"] == "gap_filling"]
+        assert gap, "七选五 must be found without asking the model"
+        assert "____36____" in gap[0]["question_text"]
+        # ...and it must no longer be hiding inside 阅读D.
+        reading_d = [s for s in segments if s["section"] == "reading_d"][0]
+        assert "____36____" not in reading_d["question_text"]
 
 
 def test_host_range_points_at_the_section_that_swallowed_it():
@@ -115,7 +145,7 @@ def test_repair_recovers_the_missing_section_and_keeps_it_cloneable():
         sections = {s["section"] for s in before}
         assert "gap_filling" not in sections, "fixture must reproduce the miss"
 
-        start = [b.body_index for b in doc.blocks if b.text.startswith("第二节（共5小题")][0]
+        start = [b.body_index for b in doc.blocks if b.text.strip() == "第二节"][0]
         extra = sr.locate_missing_sections(
             doc, before, ["gap_filling"],
             ask=lambda _p: f'{{"start_block": {start}}}',
@@ -158,7 +188,7 @@ def test_repair_turns_the_warning_into_a_pass():
 
         assert "gap_filling" in evaluate_document(src.name, rows_for(before))["missing"]
 
-        start = [b.body_index for b in doc.blocks if b.text.startswith("第二节（共5小题")][0]
+        start = [b.body_index for b in doc.blocks if b.text.strip() == "第二节"][0]
         extra = sr.locate_missing_sections(
             doc, before, ["gap_filling"],
             ask=lambda _p: f'{{"start_block": {start}}}', log=lambda _m: None,

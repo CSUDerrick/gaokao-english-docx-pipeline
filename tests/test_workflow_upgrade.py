@@ -40,7 +40,13 @@ def test_worker_defaults_are_sixteen():
     assert args.segment_warning_fallback is True
 
 
-def test_clean_and_tail_bleed_do_not_trigger_fallback():
+def test_answer_bleed_is_structural_not_cosmetic():
+    """An answer inside a question body must stop the run, not be waved through.
+
+    The writing sections used to be *exempted* from the leak check, on the theory
+    that a bit of trailing answer text was only cosmetic. It was not: that
+    exemption is how model essays and 【21题详解】 blocks reached the student paper.
+    """
     with tempfile.TemporaryDirectory() as td:
         folder = Path(td)
         sections = [
@@ -53,8 +59,18 @@ def test_clean_and_tail_bleed_do_not_trigger_fallback():
         assert result["sub_grade"] == "clean"
         assert result["needs_model_fallback"] is False
 
-        clean[-1] = _row(folder, "continuation_writing", question="Writing prompt 参考答案")
-        tail = evaluate_document("paper.docx", clean)
+        for leak in ("Writing prompt 参考答案", "Writing prompt 参考范文", "Writing prompt 【32题详解】", "21—23. CBC"):
+            bled = list(clean)
+            bled[-1] = _row(folder, "continuation_writing", question=leak)
+            graded = evaluate_document("paper.docx", bled)
+            assert graded["grade"] == "WARN", leak
+            assert graded["sub_grade"] == "structural", leak
+            assert graded["needs_model_fallback"] is True, leak
+
+        # A layout hint is still merely cosmetic — it is not an answer.
+        cosmetic = list(clean)
+        cosmetic[-1] = _row(folder, "continuation_writing", question="Writing prompt 请在答题卡上作答")
+        tail = evaluate_document("paper.docx", cosmetic)
         assert tail["grade"] == "PASS"
         assert tail["sub_grade"] == "tail-bleed"
         assert tail["needs_model_fallback"] is False
@@ -227,16 +243,20 @@ def test_directory_clear_is_scoped_and_independent():
         assert not list(target.iterdir())
 
 
-def test_cached_enrichment_is_restored_without_overwriting_current_data():
+def test_cached_explanation_is_restored_without_overwriting_current_data():
+    # selected_items.json is rewritten by several stages, so a row can come back
+    # without the explanation the export needs. The cache refills those, but must
+    # never clobber an explanation that is already there.
     selected = [
         {"item_id": "a"},
-        {"item_id": "b", "enrichment": {"teaching_notes": "current"}},
+        {"item_id": "b", "explanation": {"questions": [{"number": "24"}]}},
     ]
     cache = [
-        {"item_id": "a", "enrichment": {"teaching_notes": "cached"}},
-        {"item_id": "b", "enrichment": {"teaching_notes": "old"}},
+        {"item_id": "a", "explanation": {"questions": [{"number": "21"}]}, "has_official_explanation": True},
+        {"item_id": "b", "explanation": {"questions": [{"number": "99"}]}, "has_official_explanation": False},
     ]
-    merged = pipeline.merge_cached_enrichments(selected, cache)
+    merged = pipeline.merge_cached_explanations(selected, cache)
     assert merged == 1
-    assert selected[0]["enrichment"]["teaching_notes"] == "cached"
-    assert selected[1]["enrichment"]["teaching_notes"] == "current"
+    assert selected[0]["explanation"]["questions"][0]["number"] == "21"
+    assert selected[0]["has_official_explanation"] is True
+    assert selected[1]["explanation"]["questions"][0]["number"] == "24", "current data wins"

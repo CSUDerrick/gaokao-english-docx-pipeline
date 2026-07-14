@@ -13,88 +13,86 @@ letters and model essays — so it is built from the structured data instead.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import tempfile
 from pathlib import Path
 
+import docx_blocks as db
 import docx_splice as ds
 from bundle_paths import template_dir
+from segment_quality import answer_leaks
 
 STUDENT = "高三英语精选试题_学生版.docx"
 TEACHER = "高三英语精选试题_教师讲解版.docx"
 ANSWERS = "高三英语精选试题_答案汇总版.docx"
+VOCAB = "高三英语精选试题_重难点词汇表_学生版.docx"
+
+# Anything here in the student sheet means a defect upstream leaked an answer or
+# a paper name onto the page a student actually sits with.
+_STUDENT_FORBIDDEN = [
+    ("题目来源", re.compile(r"来源[：:]")),
+    ("答案解析", re.compile(r"【导语】|【\d+题详解】|【详解】")),
+    ("参考范文", re.compile(r"参考范文|One possible version")),
+    ("Markdown 符号", re.compile(r"\*\*")),
+]
+
+
+def assert_student_edition_is_clean(path: Path) -> None:
+    """Refuse to ship a student paper that carries answers or source attribution.
+
+    A wrong-but-plausible file is worse than no file: the teacher would hand it
+    out. This is the last gate, so it checks the finished .docx rather than the
+    data that built it.
+    """
+    text = db.read_docx(path).text
+    found = [name for name, pattern in _STUDENT_FORBIDDEN if pattern.search(text)]
+    found += answer_leaks(text)
+    if found:
+        raise RuntimeError(f"{path.name}: 学生版混入了不该出现的内容 ({', '.join(found)})")
 
 
 def _load(path: Path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _notes_for(row: dict, pipeline) -> list[tuple[str, str]]:
-    score = row.get("score") if isinstance(row.get("score"), dict) else {}
-    enrichment = row.get("enrichment") if isinstance(row.get("enrichment"), dict) else {}
-    s = (score or {}) | (enrichment or {})
+OFFICIAL_HEADING = "官方答案与解析"
+AI_HEADING = "详细解析和解答步骤"
+NO_OFFICIAL = "（原卷未提供逐题解析）"
 
-    notes: list[tuple[str, str]] = [
-        (ds.NOTE_HEADING, "教师讲解"),
-        (
-            ds.NOTE_BODY,
-            f"主题：{s.get('topic', '')}\n"
-            f"评分：新颖度 {s.get('novelty_score', '')}；难度 {s.get('difficulty_score', '')}；"
-            f"词汇价值 {s.get('vocabulary_value_score', '')}；语法价值 {s.get('grammar_value_score', '')}；"
-            f"推荐度 {s.get('recommendation_score', '')}\n"
-            f"入选理由：{s.get('selection_reason', '')}\n"
-            f"课堂建议：{s.get('classroom_suggestion', '')}",
-        ),
-    ]
 
-    sections = [
-        ("重点词汇", "\n".join(
-            x for x in (
-                pipeline.render_words(s.get("core_high_frequency_words", [])),
-                pipeline.render_words(s.get("familiar_words_new_meanings", [])),
-                pipeline.render_words(s.get("difficult_or_low_frequency_words", [])),
-            ) if x.strip()
-        )),
-        ("语法与词汇变形", pipeline.render_grammar(s.get("word_formation_and_grammar", []))),
-        ("长难句", pipeline.render_sentences(s.get("long_difficult_sentences", []))),
-        ("补充讲解建议", str(s.get("teaching_notes", "") or "暂无")),
-    ]
-    for title, body in sections:
-        if body and body.strip():
-            notes.append((ds.NOTE_HEADING, title))
-            notes.append((ds.NOTE_BODY, body))
-    return notes
+def _ai_notes(row: dict, pipeline) -> list[tuple[str, str]]:
+    """The per-question explanation that goes below the paper's own."""
+    body = pipeline.render_explanation(row.get("explanation"))
+    if not body.strip():
+        return []
+    return [(ds.NOTE_HEADING, AI_HEADING), (ds.NOTE_BODY, body)]
+
+
+def _official_fallback_text(segment: dict, pipeline) -> str:
+    """What to print when there are no 【N题详解】 blocks to clone.
+
+    Not the same thing as the paper saying nothing: for the writing sections the
+    paper's answer *is* its 参考范文, and ``official_explanation_text`` hands that
+    back. Only when it comes back empty has the paper truly explained nothing —
+    and even then the answers are known, because they come from the answer key.
+    So print those and say plainly that no worked explanation exists.
+    """
+    official = pipeline.official_explanation_text(segment)
+    if official:
+        return official
+    return f"{pipeline.answer_key_text(segment.get('answer_key'))}\n{NO_OFFICIAL}"
 
 
 TEMPLATE_DIR = template_dir()
 
 
-def _force_a4(doc) -> None:
-    """Set A4 explicitly rather than trusting the template to be found.
-
-    python-docx defaults to US Letter, so if the template ever goes missing the
-    answer sheet silently comes out the wrong size — which is exactly what
-    happened inside the packaged app.
-    """
-    from docx.shared import Cm
-
-    for section in doc.sections:
-        section.page_width = Cm(21.0)
-        section.page_height = Cm(29.7)
-
-
 def _answers_doc(rows: list[dict], out: Path, pipeline) -> Path:
-    from docx import Document
-
     # Built on the existing A4 template so the answer sheet keeps the Chinese
     # font mapping and footer that the student/teacher versions inherit from the
-    # source papers.
-    template = TEMPLATE_DIR / "answers_reference.docx"
-    doc = Document(str(template)) if template.exists() else Document()
-    for para in list(doc.paragraphs):
-        para._element.getparent().remove(para._element)
-    _force_a4(doc)
-
+    # source papers. blank_template() also strips the template's own demo table,
+    # which used to ride along as a stray "Table 1 2" grid.
+    doc = ds.blank_template(TEMPLATE_DIR / "answers_reference.docx")
     ds.ensure_note_styles(doc)
     doc.add_paragraph("高三英语答案汇总", style=ds.NOTE_HEADING)
 
@@ -118,14 +116,7 @@ def _plain_doc(heading: str, text: str, notes: list[tuple[str, str]], out: Path)
 
     Loses the original typesetting, but keeps the question in the paper.
     """
-    from docx import Document
-
-    template = TEMPLATE_DIR / "student_reference.docx"
-    doc = Document(str(template)) if template.exists() else Document()
-    for para in list(doc.paragraphs):
-        para._element.getparent().remove(para._element)
-    _force_a4(doc)
-
+    doc = ds.blank_template(TEMPLATE_DIR / "student_reference.docx")
     ds.ensure_note_styles(doc)
     doc.add_paragraph(ds.sanitize(heading), style=ds.NOTE_HEADING)
     for line in ds.sanitize(text).split("\n"):
@@ -147,9 +138,9 @@ def export_selected(out_dir: Path, pipeline, log=print) -> list[Path]:
         raise SystemExit(f"Missing {selection}. Run --mode select first.")
     rows = _load(selection)
 
-    enriched = out_dir / "selected_items.enriched.json"
-    if enriched.exists():
-        pipeline.merge_cached_enrichments(rows, _load(enriched))
+    explained = out_dir / "selected_items.explained.json"
+    if explained.exists():
+        pipeline.merge_cached_explanations(rows, _load(explained))
 
     rows = sorted(
         rows,
@@ -169,8 +160,23 @@ def export_selected(out_dir: Path, pipeline, log=print) -> list[Path]:
             segment = _load(Path(row["segment_path"]))
             src = segment.get("source_path")
             blocks = segment.get("source_blocks") or []
-            heading = f"{row.get('item_label', '')}｜来源：{row.get('source_doc', '')}"
+            label = row.get("item_label", "")
+            # The student sheet must not say which paper a question came from,
+            # but teacher and student have to be able to say "第 3 篇" and mean
+            # the same question — hence the shared running number.
+            # docxcompose takes a few seconds over ~40 parts; check between questions so
+            # 取消 lands here too rather than only at the stage boundary.
+            pipeline.raise_if_cancelled()
+
+            student_heading = f"第 {n + 1} 篇　{label}"
+            teacher_heading = f"第 {n + 1} 篇　{label}｜来源：{row.get('source_doc', '')}"
             cloneable = bool(src) and len(blocks) == 2 and Path(src).exists()
+
+            # The teacher edition is three blocks per question: the question, the
+            # paper's own answer and explanation, then ours. The first two are
+            # clones of the original OOXML; only the third is generated text.
+            notes = _ai_notes(row, pipeline)
+            official = segment.get("official_explanation_blocks") or []
 
             if not cloneable:
                 # No pointer back into an original docx (AI-segmented text the
@@ -179,10 +185,18 @@ def export_selected(out_dir: Path, pipeline, log=print) -> list[Path]:
                 # unstyled one.
                 skipped.append(str(row.get("item_id")))
                 text = segment.get("question_text") or ""
-                sp = _plain_doc(heading, text, [], tmp / f"s{n:03d}.docx")
-                tp = _plain_doc(heading, text, _notes_for(row, pipeline), tmp / f"t{n:03d}.docx")
+                sp = _plain_doc(student_heading, text, [], tmp / f"s{n:03d}.docx")
+                tp = _plain_doc(teacher_heading, text, [], tmp / f"t{n:03d}.docx")
                 student_parts.append(sp)
                 teacher_parts.append(tp)
+                teacher_parts.append(
+                    _plain_doc(
+                        OFFICIAL_HEADING,
+                        _official_fallback_text(segment, pipeline),
+                        notes,
+                        tmp / f"t{n:03d}x.docx",
+                    )
+                )
                 continue
 
             lo, hi = blocks
@@ -190,13 +204,30 @@ def export_selected(out_dir: Path, pipeline, log=print) -> list[Path]:
 
             sp = tmp / f"s{n:03d}.docx"
             ds.clone_subset(Path(src), indices, sp)
-            ds.decorate(sp, heading=heading)
+            ds.decorate(sp, heading=student_heading)
             student_parts.append(sp)
 
             tp = tmp / f"t{n:03d}.docx"
             ds.clone_subset(Path(src), indices, tp)
-            ds.decorate(tp, heading=heading, notes=_notes_for(row, pipeline))
+            ds.decorate(tp, heading=teacher_heading)
             teacher_parts.append(tp)
+
+            if len(official) == 2:
+                # Clone the paper's own 【N题详解】 paragraphs, with their original
+                # typesetting, the same way the question itself is cloned.
+                ep = tmp / f"t{n:03d}x.docx"
+                ds.clone_subset(Path(src), list(range(official[0], official[1])), ep)
+                ds.decorate(ep, heading=OFFICIAL_HEADING, notes=notes)
+            else:
+                # The paper never explained this one (广东 skips four whole
+                # sections). Print the answers anyway and say so.
+                ep = _plain_doc(
+                    OFFICIAL_HEADING,
+                    _official_fallback_text(segment, pipeline),
+                    notes,
+                    tmp / f"t{n:03d}x.docx",
+                )
+            teacher_parts.append(ep)
 
         if skipped:
             log(f"  WARNING: {len(skipped)} 道题无法定位到原卷段落，已按纯文本导出（格式需手动调整）：{', '.join(skipped)}")
@@ -221,5 +252,6 @@ def export_selected(out_dir: Path, pipeline, log=print) -> list[Path]:
 
     for path in created:
         ds.validate(path)
+    assert_student_edition_is_clean(docx_dir / STUDENT)
 
     return created

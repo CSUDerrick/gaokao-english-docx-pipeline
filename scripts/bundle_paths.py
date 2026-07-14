@@ -22,3 +22,18 @@ def bundle_root() -> Path:
 
 def template_dir() -> Path:
     return bundle_root() / "assets" / "word_templates"
+
+
+def tokenizer_path() -> Path:
+    """DeepSeek's published V3 vocabulary, used to count tokens offline."""
+    return bundle_root() / "assets" / "deepseek_tokenizer" / "tokenizer.json"
+
+
+def prompt_dir() -> Path:
+    """Where the per-question-type explanation prompts live.
+
+    They are markdown rather than Python string literals so a teacher can read and
+    tweak the wording without touching code — which means they are data, and the
+    packaged app has to ship them (``--add-data "prompts:prompts"``).
+    """
+    return bundle_root() / "prompts"

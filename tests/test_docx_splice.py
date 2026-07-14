@@ -23,6 +23,8 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import docx_blocks as db  # noqa: E402
 import docx_splice as ds  # noqa: E402
 from docx import Document  # noqa: E402
+from docx.oxml.ns import qn  # noqa: E402
+from docx.oxml import OxmlElement  # noqa: E402
 from docx.shared import Inches  # noqa: E402
 from lxml import etree  # noqa: E402
 
@@ -193,6 +195,195 @@ def test_notes_strip_illegal_control_characters():
         # the blank marker must survive literally, not become bold (the old
         # Markdown path read ____ as __strong__)
         assert "____36____" in db.read_docx(out).text
+
+
+def _bookmarked(path: Path) -> Path:
+    """A paper whose bookmark spans two paragraphs — like Word's own OLE_LINKs."""
+    from docx.shared import Cm
+
+    doc = Document()
+    for section in doc.sections:  # real papers are A4; validate() insists on it
+        section.page_width, section.page_height = Cm(21.0), Cm(29.7)
+    doc.add_paragraph("第一段：题干开始。" * 6)
+    keep = doc.add_paragraph("第二段：被保留的段落。" * 6)
+    drop = doc.add_paragraph("第三段：不会被克隆的段落。" * 6)
+
+    start = OxmlElement("w:bookmarkStart")
+    start.set(qn("w:id"), "7")
+    start.set(qn("w:name"), "OLE_LINK7")
+    keep._p.insert(0, start)
+
+    end = OxmlElement("w:bookmarkEnd")
+    end.set(qn("w:id"), "7")
+    drop._p.append(end)
+
+    doc.save(str(path))
+    return path
+
+
+def test_clone_drops_bookmarks_whose_partner_was_not_cloned():
+    """Word reported "unreadable content" on a bookmarkStart with no bookmarkEnd.
+
+    Subsetting a body by paragraph index can keep one half of a paired range
+    marker and drop the other. The shipped teacher edition had 8 bookmarkStart
+    and 6 bookmarkEnd (OLE_LINK7/OLE_LINK8) and Word demanded a repair on open.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        src = _bookmarked(tmp / "a.docx")
+        assert _count(src, "bookmarkStart") == 1 and _count(src, "bookmarkEnd") == 1
+
+        # keep the paragraph holding bookmarkStart, drop the one holding bookmarkEnd
+        out = ds.clone_subset(src, [0, 1], tmp / "c.docx")
+        assert _count(out, "bookmarkStart") == 0, "the orphaned start must be removed"
+        assert _count(out, "bookmarkEnd") == 0
+        ds.validate(out)  # the gate that would have caught this before shipping
+
+        # a bookmark whose two halves both survive is left alone
+        both = ds.clone_subset(src, [0, 1, 2], tmp / "d.docx")
+        assert _count(both, "bookmarkStart") == 1
+        assert _count(both, "bookmarkEnd") == 1
+        ds.validate(both)
+
+
+def test_validate_rejects_an_unpaired_bookmark():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        src = _bookmarked(tmp / "a.docx")
+        out = ds.clone_subset(src, [0, 1, 2], tmp / "c.docx")
+
+        # re-introduce the defect behind clone_subset's back
+        with zipfile.ZipFile(out) as z:
+            entries = [(i, z.read(i.filename)) for i in z.infolist()]
+        doc = etree.fromstring(dict((i.filename, d) for i, d in entries)["word/document.xml"])
+        for el in doc.iter(W + "bookmarkEnd"):
+            el.getparent().remove(el)
+        rewritten = etree.tostring(doc, xml_declaration=True, encoding="UTF-8", standalone=True)
+        broken = tmp / "broken.docx"
+        with zipfile.ZipFile(broken, "w", zipfile.ZIP_DEFLATED) as zout:
+            for info, data in entries:
+                zout.writestr(info, rewritten if info.filename == "word/document.xml" else data)
+
+        try:
+            ds.validate(broken)
+        except RuntimeError as exc:
+            assert "bookmarkStart" in str(exc)
+        else:
+            raise AssertionError("validate must reject an unpaired range marker")
+
+
+def test_markdown_symbols_never_reach_word():
+    """Word prints text verbatim, so "**原句：**" lands on the page as asterisks.
+
+    The model is told not to emit Markdown, but the pipeline's own renderers used
+    to add it — they were written for the Pandoc era and feed both sinks.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        src = _fixture(tmp / "a.docx")
+        out = ds.clone_subset(src, [0], tmp / "c.docx")
+        ds.decorate(out, notes=[
+            (ds.NOTE_BODY, "1. **原句：** He ran.\n   - `crucial`：关键的\n# 标题"),
+            (ds.NOTE_BODY, "答案填入 ____36____ 处"),
+        ])
+
+        text = db.read_docx(out).text
+        assert "**" not in text
+        assert "`" not in text
+        assert "原句：" in text and "crucial" in text, "only the syntax goes, not the content"
+        assert "标题" in text, "a heading's text stays, only the # goes"
+        # underscores are NOT Markdown here: ____36____ is a fill-in blank
+        assert "____36____" in text
+
+
+def test_template_demo_content_does_not_ride_along():
+    """The reference templates ship with a demo table as well as demo paragraphs.
+
+    The builders only deleted `doc.paragraphs`, so a stray "Table 1 2" grid was
+    printed at the top of every answer sheet that shipped.
+    """
+    import export_docx_splice as ex
+
+    for name in ("student_reference.docx", "answers_reference.docx"):
+        template = ex.TEMPLATE_DIR / name
+        with zipfile.ZipFile(template) as z:
+            source = etree.fromstring(z.read("word/document.xml"))
+        assert source.findall(".//" + W + "tbl"), f"{name} is expected to carry a demo table"
+
+        doc = ds.blank_template(template)
+        body = doc.element.body
+        kept = [c for c in body if isinstance(c.tag, str)]
+        assert all(c.tag.endswith("}sectPr") for c in kept), "only page setup may survive"
+
+
+def test_scrub_removes_lastprinted_instead_of_blanking_it():
+    """An empty date is not "no date", it is a malformed date, and Word rejects it.
+
+    scrub_metadata used to set cp:lastPrinted to "" — producing
+    <cp:lastPrinted></cp:lastPrinted>, an empty string where the schema wants a
+    dateTime. Word answered with 「发现无法读取的内容」. Only the student and
+    teacher editions carried it (they clone the source paper's docProps); the
+    answer sheet is built from a template that has none, which is exactly why it
+    was the one file that never complained.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        src = _fixture(tmp / "a.docx")
+
+        # give the fixture a printed date, like a real exam paper has
+        with zipfile.ZipFile(src) as z:
+            entries = [(i, z.read(i.filename)) for i in z.infolist()]
+        core = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<cp:coreProperties '
+            'xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" '
+            'xmlns:dc="http://purl.org/dc/elements/1.1/" '
+            'xmlns:dcterms="http://purl.org/dc/terms/" '
+            'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">'
+            "<dc:creator>某位老师</dc:creator>"
+            "<cp:lastPrinted>2026-05-30T03:25:00Z</cp:lastPrinted>"
+            '<dcterms:created xsi:type="dcterms:W3CDTF">2026-05-29T21:37:00Z</dcterms:created>'
+            "</cp:coreProperties>"
+        ).encode()
+        with zipfile.ZipFile(src, "w", zipfile.ZIP_DEFLATED) as zout:
+            for info, data in entries:
+                zout.writestr(info, core if info.filename == "docProps/core.xml" else data)
+
+        out = ds.clone_subset(src, [0], tmp / "c.docx")
+        ds.scrub_metadata(out, "标题")
+
+        assert ds.empty_typed_core_properties(out) == [], "an empty dateTime must never survive"
+        with zipfile.ZipFile(out) as z:
+            core_xml = z.read("docProps/core.xml").decode()
+        assert "lastPrinted" not in core_xml, "the field is removed, not blanked"
+        assert "某位老师" not in core_xml, "the original author must still be scrubbed"
+        assert "2026-05-29T21:37:00Z" in core_xml, "valid dates are left alone"
+
+
+def test_table_borders_land_before_tbllook():
+    """CT_TblPrBase is a sequence — tblBorders after tblLook is invalid OOXML.
+
+    python-docx's add_table() emits tblW + tblLook, so simply appending the
+    borders put them last, which is out of order and makes Word repair the file.
+    """
+    from docx import Document
+    from docx.shared import Cm
+
+    with tempfile.TemporaryDirectory() as tmp:
+        doc = Document()
+        for section in doc.sections:
+            section.page_width, section.page_height = Cm(21.0), Cm(29.7)
+        table = doc.add_table(rows=2, cols=2)
+        ds.set_table_borders(table)
+
+        names = [c.tag.rsplit("}", 1)[-1] for c in table._tbl.tblPr]
+        assert "tblBorders" in names
+        ranks = [ds.TBL_PR_ORDER.index(n) for n in names if n in ds.TBL_PR_ORDER]
+        assert ranks == sorted(ranks), f"tblPr children out of schema order: {names}"
+
+        out = Path(tmp) / "t.docx"
+        doc.save(str(out))
+        ds.validate(out)
 
 
 def test_heading_is_prepended_not_appended():

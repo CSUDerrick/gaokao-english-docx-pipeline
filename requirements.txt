@@ -5,6 +5,21 @@ python-docx==1.2.0    # build explanation paragraphs and the answer sheet
 docxcompose==1.4.1    # merge papers, remapping colliding style/image ids
 lxml>=5.0             # namespace-preserving OOXML (ElementTree mangles it)
 
+# DeepSeek's own tokenizer, so the cost estimate is a count and not a guess.
+# Install with --no-deps: tokenizers pulls in huggingface-hub/httpx/tqdm for
+# from_pretrained(), and we only ever call Tokenizer.from_file() on the vocab
+# bundled at assets/deepseek_tokenizer/. The pipeline degrades to a character
+# estimate if it is missing, so this is a soft dependency.
+tokenizers>=0.15      # pip install --no-deps tokenizers
+
 # Optional: DeepSeek via the OpenAI SDK. The pipeline falls back to a stdlib
 # urllib client when this is absent (--client http).
 # openai>=1.0
+
+# HTTPS on a Mac whose network re-signs certificates (school proxy, antivirus, VPN).
+# truststore verifies against the macOS Keychain, which is where those products put
+# their root — Python's own CA bundle cannot see it, and every call died with
+# "self-signed certificate in certificate chain". certifi is only the fallback for a
+# build that shipped no CA bundle at all; it cannot fix the interception case.
+truststore>=0.9    # macOS 10.8+, Python 3.10+
+certifi

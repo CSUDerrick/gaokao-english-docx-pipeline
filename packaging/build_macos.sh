@@ -20,12 +20,18 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-APP_NAME="高三英语试卷整理工具"
+APP_NAME="英语试卷整理工具"
 VERSION="$(grep -m1 '^VERSION = ' app/main.py | cut -d'"' -f2)"
 PY="${PY:-$ROOT/.venv/bin/python}"
 
 echo "==> Building $APP_NAME v$VERSION"
-rm -rf build dist
+
+# Redrawn from source every build, so the shipped icon can never drift from the code
+# that defines it (scripts/make_icon.py).
+"$PY" scripts/make_icon.py
+# Retried: if dist/ is open in Finder it writes a .DS_Store while rm is walking the
+# tree, and rm exits "Directory not empty" — which killed the build under `set -e`.
+rm -rf build dist || rm -rf build dist
 
 "$PY" -m PyInstaller \
   --name "$APP_NAME" \
@@ -33,21 +39,35 @@ rm -rf build dist
   --noconfirm \
   --clean \
   --osx-bundle-identifier "com.csuderrick.gaokao-english" \
+  --icon assets/icon.icns \
   --add-data "assets:assets" \
   --add-data "config:config" \
   --add-data "scripts:scripts" \
+  --add-data "prompts:prompts" \
   --paths app \
   --hidden-import settings \
   --paths scripts \
+  --hidden-import answer_explanation \
+  --hidden-import net_tls \
+  --hidden-import deepseek_tokens \
+  --hidden-import run_timing \
   --hidden-import docx_blocks \
   --hidden-import docx_splice \
   --hidden-import export_docx_splice \
+  --hidden-import export_vocab_docx \
+  --hidden-import model_presets \
+  --hidden-import providers \
+  --hidden-import usage_report \
   --hidden-import pdf_ingest \
+  --hidden-import mineru_ingest \
   --hidden-import segment_quality \
   --hidden-import segment_repair \
   --hidden-import bundle_paths \
   --hidden-import gaokao_english_docx_pipeline \
   --collect-all docx \
+  --collect-all tokenizers \
+  --collect-all truststore \
+  --collect-all certifi \
   --collect-all docxcompose \
   --exclude-module streamlit \
   --exclude-module pandas \

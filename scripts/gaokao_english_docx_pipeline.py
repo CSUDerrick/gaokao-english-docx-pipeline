@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import functools
 import contextlib
 import csv
 import json
@@ -27,10 +28,13 @@ import os
 import random
 import re
 import shutil
+import socket
 import sys
+import threading
 import time
 import http.client
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from dataclasses import dataclass, asdict
@@ -39,6 +43,16 @@ from pathlib import Path
 from typing import Iterable
 from xml.etree import ElementTree as ET
 
+import deepseek_tokens
+import model_presets as mp
+import net_tls
+import providers as pv
+from answer_explanation import (
+    SECTION_QUESTION_RANGES,
+    OfficialExplanations,
+    question_numbers,
+)
+from bundle_paths import prompt_dir
 from docx_blocks import DocxDoc, find_block_range, read_docx
 from segment_quality import evaluate_document
 from segment_repair import locate_missing_sections
@@ -118,6 +132,8 @@ SEGMENT_PROMPT_VERSION = "segment_v1"
 SCORE_PROMPT_VERSION = "score_v1"
 REVIEW_SELECT_PROMPT_VERSION = "review_select_v1"
 ENRICH_PROMPT_VERSION = "enrich_selected_v1"
+EXPLAIN_PROMPT_VERSION = "explain_v1"
+VOCAB_PROMPT_VERSION = "vocab_handout_v1"
 
 
 @dataclass
@@ -163,10 +179,14 @@ def file_size_label(path: Path) -> str:
     return f"{size / (1024 * 1024):.1f} MB"
 
 
-def rough_token_estimate(text: str) -> int:
-    """Cheap mixed Chinese/English token estimate for preflight cost checks."""
+def count_tokens(text: str) -> int:
+    """Tokens as DeepSeek counts them (see ``deepseek_tokens``).
 
-    return max(1, len(text) // 3)
+    Replaces a ``len(text) // 3`` estimate that was wrong in both directions —
+    ~40% low on Chinese, ~40% high on English — which is no basis for quoting a
+    teacher what a run will cost.
+    """
+    return deepseek_tokens.count(text)
 
 
 def preview_text(text: str, max_chars: int) -> str:
@@ -399,6 +419,33 @@ def score_number(value: object) -> float:
 
 NO_ANSWER_MARKER = "原卷未提供答案"
 
+# A compact answer run: "21—23. CBC", "1—5 BBCBA", "41-45 BDBAC".
+# Groups: first question, last question, the letters.
+_ANSWER_RUN = re.compile(r"(?m)^\s*(\d{1,2})\s*[-—~－–]+\s*(\d{1,2})\s*[.．、:：]?\s*([A-G]{2,})\b")
+# Per-question explanations that every 答案 section of these papers carries.
+_ANSWER_EXPL = re.compile(r"【导语】|【\d+题详解】|【详解】")
+
+# Lines that separate the question body from the answer key but belong to
+# neither: a "…答案 转载公众号…" credit line, or a bare repeat of the paper
+# title. They sit right above the cut and would otherwise be printed at the end
+# of the last question. Rules of underscores are deliberately NOT junk — those
+# are the lines students write the continuation essay on.
+_BODY_TRAILING_JUNK = (
+    re.compile(r"答案.*(?:转载|公众号|感谢)"),
+    re.compile(r"^(?![^\n]*[A-Za-z])[^\n]{4,60}(?:试题|试卷|密卷|联考|模拟考试|适应性考试)[^\n]{0,10}$"),
+)
+
+
+def _trim_trailing_junk(text: str, cut: int) -> int:
+    """Move the answer-section boundary up over the junk lines just above it."""
+    while cut > 0:
+        prev_start = text.rfind("\n", 0, cut - 1) + 1
+        line = text[prev_start:cut].strip()
+        if line and not any(p.search(line) for p in _BODY_TRAILING_JUNK):
+            break
+        cut = prev_start
+    return cut
+
 
 def answer_key_text(answer_key: object) -> str:
     if not answer_key:
@@ -428,7 +475,18 @@ def segment_body(segment: dict) -> str:
 
 
 def _find_answer_section_start(text: str) -> int | None:
-    """Return the character position where the answer section begins, or None."""
+    """Return the character position where the answer section begins, or None.
+
+    Every detector below produces *candidates* and the earliest one wins.
+    Returning as soon as one detector matched — the old behaviour — cut the
+    paper too late on all three sample papers, because the two earliest signals
+    (a header-less answer key like "21—23. CBC", and the 【21题详解】 blocks)
+    were only looked for by the last stage. The answer section then stayed
+    inside the body, and every later section start was free to land in it: the
+    writing questions ended up swallowed by 语法填空, while the items labelled
+    应用文/读后续写 held the model essays from the answer key.
+    """
+    candidates: list[int] = []
     # --- Stage 1: answer header on its own line ---
     # Covers: "参考答案", "答案解析", "英语答案", "听力原文", "听力录音稿",
     # "参考答案及评分标准", "部分试题详解", etc.
@@ -470,8 +528,8 @@ def _find_answer_section_start(text: str) -> int | None:
         if re.search(r"\d+[-—~]\d+\s*[A-G]|\d+\.[A-G]\b|^\d+\.\s*\w+", after, re.M):
             inline_candidates.append(candidate)
 
-    if line_candidates or inline_candidates:
-        return min(line_candidates + inline_candidates)
+    candidates.extend(line_candidates)
+    candidates.extend(inline_candidates)
 
     # --- Stage 2.5: model-essay / transcript boundary markers ---
     # These patterns indicate the answer section has started even without
@@ -497,7 +555,8 @@ def _find_answer_section_start(text: str) -> int | None:
     )
     tail60_start = max(0, len(text) * 2 // 5)  # last 60 %
     tail_matches = list(re.finditer(_TAIL_MARKERS, text[tail60_start:]))
-    if tail_matches:
+
+    def _tail_marker_candidate() -> int | None:
         for tm in tail_matches:
             candidate = tail60_start + tm.start()
             marker_text = text[candidate:candidate + 50]
@@ -548,19 +607,34 @@ def _find_answer_section_start(text: str) -> int | None:
             if candidate >= 2 and text[candidate - 2:candidate] == "\n\n":
                 line_start = text.rfind("\n", 0, candidate) + 1
                 return line_start
+        return None
 
-    # --- Stage 3: answer-range lines in the last 25 % ---
-    tail_start = max(0, len(text) - max(1, len(text) // 4))
-    answer_line = re.search(r"(?m)^\s*\d+[-—~]\d+\s*[.．]?\s*[A-G]+", text[tail_start:])
-    if answer_line:
-        answer_line_pos = tail_start + answer_line.start()
-        before = text[:answer_line_pos]
-        header = re.search(r"(?im)(?:英语)?(?:参考答案|答案解析|试题答案|英语答案|听力原文|听力录音稿|录音原文|答案及评分标准)[^\n]{0,30}$", before)
-        if header:
-            return header.start()
-        return answer_line_pos
+    tail_marker = _tail_marker_candidate()
+    if tail_marker is not None:
+        candidates.append(tail_marker)
 
-    return None
+    # --- Stage 3: the answer key itself, with or without a header ---
+    # The single most reliable signal: a compact answer run such as
+    # "21—23. CBC" or "1—5 BBCBA". A question never looks like this, and every
+    # paper has one — including the ones whose answer header is unmatchable
+    # ("广东…密卷答案 转载公众号…") or absent entirely (江苏 just repeats the
+    # paper title). The letter count must equal the question count, which makes
+    # false positives essentially impossible.
+    body_start = len(text) * 35 // 100
+    for match in _ANSWER_RUN.finditer(text, body_start):
+        first, last, letters = int(match.group(1)), int(match.group(2)), match.group(3)
+        if last > first and len(letters) == last - first + 1:
+            candidates.append(text.rfind("\n", 0, match.start()) + 1)
+            break
+
+    # --- Stage 4: per-question answer explanations ---
+    explanation = _ANSWER_EXPL.search(text, body_start)
+    if explanation:
+        candidates.append(text.rfind("\n", 0, explanation.start()) + 1)
+
+    if not candidates:
+        return None
+    return _trim_trailing_junk(text, min(candidates))
 
 
 def extract_answer_tail(text: str, max_chars: int = 8000) -> str:
@@ -751,6 +825,7 @@ def make_local_segment(
     answer_source: str,
     source_path: str = "",
     source_blocks: list[int] | None = None,
+    official_explanation_blocks: list[int] | None = None,
 ) -> dict:
     return {
         "source_doc": source_doc,
@@ -770,6 +845,12 @@ def make_local_segment(
         # input, where no original OOXML exists to point at.
         "source_path": source_path,
         "source_blocks": source_blocks or [],
+        # The same, for the paper's own 【N题详解】 blocks. Only the indices are
+        # stored: the text itself would ride along inside json.dumps(segment) into
+        # the scoring prompt, inflating it and moving the cached prefix, and it is
+        # cheap to re-read from the source when the teacher edition is built.
+        # Empty when the paper never explained these questions.
+        "official_explanation_blocks": official_explanation_blocks or [],
     }
 
 
@@ -784,6 +865,53 @@ def trim_answer_tail_with_offset(text: str) -> tuple[str, int]:
     raw = text if start is None else text[:start]
     lead = len(raw) - len(raw.lstrip())
     return raw.strip(), lead
+
+
+# A part/section heading: it introduces the section *below* it.
+_SECTION_HEADING_LINE = re.compile(
+    r"^\s*(?:"
+    r"第[一二三四五六七八九十]+部分"
+    r"|第[一二三四五六]节"
+    r"|[（(]?\s*共\s*\d+\s*(?:小)?题"
+    r"|[（(]?\s*满分\s*\d+\s*分"
+    r")"
+)
+
+
+def _enforce_canonical_order(
+    starts: list[tuple[int, str, str]], source_doc: str
+) -> list[tuple[int, str, str]]:
+    """Drop section starts that break the paper's canonical section order.
+
+    A paper always runs 阅读A→D → 七选五 → 完形填空 → 语法填空 → 应用文 → 读后续写.
+    A keyword that matches out of that order matched something it shouldn't have
+    (historically: 应用文/读后续写 matching the *model essays* inside the answer
+    key, which then stole the real writing questions from 语法填空). Keep the
+    longest run that is consistent with the canonical order and discard the rest,
+    rather than trusting a start whose position contradicts its own label.
+    """
+    if len(starts) < 2:
+        return starts
+
+    # Longest strictly-increasing subsequence over section_order, by position.
+    best: list[int] = []
+    prev: list[int] = [-1] * len(starts)
+    length = [1] * len(starts)
+    for i in range(len(starts)):
+        for j in range(i):
+            if section_order(starts[j][1]) < section_order(starts[i][1]) and length[j] + 1 > length[i]:
+                length[i] = length[j] + 1
+                prev[i] = j
+    end = max(range(len(starts)), key=lambda i: length[i])
+    while end != -1:
+        best.append(end)
+        end = prev[end]
+    keep = set(best)
+
+    dropped = [starts[i][2] for i in range(len(starts)) if i not in keep]
+    if dropped:
+        print(f"[segment] {source_doc}: 丢弃顺序异常的切分起点 {', '.join(dropped)}")
+    return [starts[i] for i in sorted(keep)]
 
 
 def local_segment_paper(
@@ -805,8 +933,43 @@ def local_segment_paper(
     # Use full-text scan for robust answer extraction (handles table format,
     # double-hyphen ranges, concatenated grammar answers, etc.)
     full_answers = extract_all_answers_from_full_text(text)
+    # The answer section is cut out of the body above, but the teacher edition
+    # clones the paper's own 【N题详解】 blocks back in, so index them before the
+    # boundary is forgotten.
+    official = (
+        OfficialExplanations(doc, _find_answer_section_start(text))
+        if doc is not None
+        else None
+    )
     lines = line_spans(body)
     starts: list[tuple[int, str, str]] = []
+
+    def add_start(section: str, label: str, idx: int | None) -> int | None:
+        """Register a section start, moved up over its own heading lines.
+
+        The keyword rules match the *content* line ("阅读下面材料，在空白处填入…"),
+        but the heading above it ("第二节（共10小题；每小题1.5分，满分15分）")
+        introduces this section, not the previous one. Anchoring on the content
+        line left those headings dangling at the tail of the previous question.
+        """
+        if idx is None:
+            return None
+        floor = max((pos for pos, _, _ in starts), default=-1)
+        at = idx
+        while at > 0:
+            prev = at - 1
+            while prev > 0 and not lines[prev][2]:
+                prev -= 1
+            heading = lines[prev][2]
+            if lines[prev][0] <= floor or not heading or len(heading) > 60:
+                break
+            if not _SECTION_HEADING_LINE.match(heading):
+                break
+            at = prev
+        starts.append((lines[at][0], section, label))
+        # The *original* index is returned: later sections search downwards from
+        # it, and rewinding that cursor could re-match the heading we just took.
+        return idx
 
     read_start = find_line_index(lines, r"阅读理解|阅读下列短文|第二部分\s*阅读")
     search_from = read_start or 0
@@ -815,16 +978,22 @@ def local_segment_paper(
     c = find_standalone_letter(lines, "C", (b or search_from) + 1)
     d = find_standalone_letter(lines, "D", (c or search_from) + 1)
     for idx, section, label in [(a, "reading_a", "阅读A"), (b, "reading_b", "阅读B"), (c, "reading_c", "阅读C"), (d, "reading_d", "阅读D")]:
-        if idx is not None:
-            starts.append((lines[idx][0], section, label))
+        add_start(section, label, idx)
 
-    def add_start(section: str, label: str, idx: int | None) -> int | None:
-        if idx is not None:
-            starts.append((lines[idx][0], section, label))
-        return idx
-
-    gap_idx = add_start("gap_filling", "七选五", find_line_index(lines, r"七选五|选项中有两项(?:为)?多余选项"))
-    cloze_idx = find_line_index(lines, r"完形填空|完型填空|语言运用", (gap_idx or 0) + 1)
+    gap_idx = find_line_index(lines, r"七选五|选项中有两项(?:为)?多余选项")
+    if gap_idx is None:
+        # Some papers (江苏) never write "七选五" anywhere — the section is only
+        # identifiable by its mark scheme, which is unique in the paper: 5
+        # questions worth 12.5 marks. Searching below 阅读D keeps it away from
+        # the listening part's own 第二节. Without this the section went missing
+        # and had to be recovered by a paid model round-trip.
+        gap_idx = find_line_index(
+            lines, r"第二节.*共\s*5\s*(?:小)?题.*满分\s*12\.?5\s*分", (d or c or b or a or search_from) + 1
+        )
+    gap_idx = add_start("gap_filling", "七选五", gap_idx)
+    # 语言知识运用 (江苏) vs 语言运用 (广东): missing the 知识 dropped the whole
+    # "第三部分…" heading onto the tail of 七选五.
+    cloze_idx = find_line_index(lines, r"完形填空|完型填空|语言(?:知识)?运用", (gap_idx or 0) + 1)
     if cloze_idx is None:
         cloze_idx = find_line_index(lines, r"第一节.*共\s*15\s*小题.*[每各]小题\s*1\s*分", (gap_idx or 0) + 1)
     if cloze_idx is None:
@@ -854,15 +1023,10 @@ def local_segment_paper(
             starts.append((adjusted, section, label))
 
     starts = sorted({(pos, section): (pos, section, label) for pos, section, label in starts}.values(), key=lambda x: x[0])
+    starts = _enforce_canonical_order(starts, source_doc)
     segments: list[dict] = []
-    answer_ranges = {
-        "reading_a": (21, 23),
-        "reading_b": (24, 27),
-        "reading_c": (28, 31),
-        "reading_d": (32, 35),
-        "gap_filling": (36, 40),
-        "cloze": (41, 55),
-    }
+    # grammar is handled on its own branch below (its answers are words, not letters).
+    answer_ranges = {k: v for k, v in SECTION_QUESTION_RANGES.items() if k != "grammar"}
     # Determine the global answer-source label for this paper.
     if not full_answers:
         global_answer_source = "原卷未提供答案"
@@ -907,10 +1071,15 @@ def local_segment_paper(
             source_blocks = [lo, hi]
             source_path = str(doc.path)
 
+        explanation_blocks: list[int] = []
+        if official is not None:
+            explanation_blocks = official.blocks_for(question_numbers(section, ak))
+
         segments.append(
             make_local_segment(
                 source_doc, section, label, qtext, ak, answer_source,
                 source_path=source_path, source_blocks=source_blocks,
+                official_explanation_blocks=explanation_blocks,
             )
         )
     return segments
@@ -1063,6 +1232,7 @@ def flatten_analysis(row: dict) -> dict:
 def call_chat_completion(
     prompt: str,
     *,
+    provider: str = pv.DEFAULT_PROVIDER,
     base_url: str,
     api_key: str,
     model: str,
@@ -1073,11 +1243,20 @@ def call_chat_completion(
     timeout: int,
     max_tokens: int | None = None,
     max_retries: int = 3,
+    history: list[dict] | None = None,
+    insecure_ssl: bool = False,
 ) -> ChatResult:
+    # Claude does not speak chat/completions, and its OpenAI-compatibility shim drops
+    # thinking and prompt caching. The SDK path is OpenAI's SDK, so it cannot serve
+    # Claude either — the HTTP adapter is the only route.
+    if pv.get(provider).protocol == pv.ANTHROPIC:
+        client_mode = "http"
+
     if client_mode in {"auto", "sdk"}:
         try:
             return call_chat_completion_sdk(
                 prompt,
+                provider=provider,
                 base_url=base_url,
                 api_key=api_key,
                 model=model,
@@ -1087,6 +1266,7 @@ def call_chat_completion(
                 timeout=timeout,
                 max_tokens=max_tokens,
                 max_retries=max_retries,
+                history=history,
             )
         except ImportError:
             if client_mode == "sdk":
@@ -1097,6 +1277,7 @@ def call_chat_completion(
 
     return call_chat_completion_http(
         prompt,
+        provider=provider,
         base_url=base_url,
         api_key=api_key,
         model=model,
@@ -1106,33 +1287,97 @@ def call_chat_completion(
         timeout=timeout,
         max_tokens=max_tokens,
         max_retries=max_retries,
+        history=history,
+        insecure_ssl=insecure_ssl,
     )
+
+
+SYSTEM_PROMPT = "你是严谨的高三英语教研分析助手。请严格遵守用户要求输出。"
 
 
 def chat_payload(
     prompt: str,
     *,
+    provider: str,
     model: str,
     temperature: float,
     reasoning_effort: str,
     thinking: str,
     max_tokens: int | None = None,
-) -> dict:
+    history: list[dict] | None = None,
+) -> tuple[dict, dict]:
+    """Build one OpenAI-shaped request. Returns ``(payload, extras)``.
+
+    ``extras`` are the vendor extensions that are *not* OpenAI-standard — DeepSeek's
+    ``thinking``, GLM's and Qwen's ``enable_thinking``. Over raw HTTP they belong in the
+    same JSON body; through the OpenAI SDK they have to travel in ``extra_body`` or the
+    SDK drops them on the floor. Keeping them separate here is what makes both paths work.
+
+    Everything vendor-specific is decided by ``providers.request_fields`` — this used to
+    write ``reasoning_effort`` and ``thinking`` unconditionally, which is why the app
+    could only ever talk to DeepSeek.
+    """
     payload = {
         "model": model,
         "messages": [
-            {"role": "system", "content": "你是严谨的高三英语教研分析助手。请严格遵守用户要求输出。"},
+            {"role": "system", "content": SYSTEM_PROMPT},
+            *(history or []),
             {"role": "user", "content": prompt},
         ],
-        "temperature": temperature,
         "stream": False,
     }
-    if reasoning_effort != "none":
-        payload["reasoning_effort"] = reasoning_effort
-    if thinking != "omit":
-        payload["thinking"] = {"type": thinking}
-    if max_tokens:
-        payload["max_tokens"] = max_tokens
+    standard, extras = pv.request_fields(
+        provider,
+        model,
+        effort=reasoning_effort,
+        thinking=thinking,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    payload.update(standard)
+    return payload, extras
+
+
+def anthropic_payload(
+    prompt: str,
+    *,
+    provider: str,
+    model: str,
+    temperature: float,
+    reasoning_effort: str,
+    thinking: str,
+    max_tokens: int | None = None,
+    history: list[dict] | None = None,
+) -> dict:
+    """Build one Claude Messages-API request.
+
+    Not the OpenAI-compatibility layer: Anthropic's own docs say that layer supports
+    neither extended thinking nor prompt caching, and both are load-bearing here
+    (决策 8 — a cache hit costs 1/120 of a miss, which is the only reason a whole paper
+    in one growing conversation is affordable).
+
+    Shape differences from chat/completions: ``system`` is a top-level field rather than
+    messages[0], and ``max_tokens`` is required rather than optional.
+    """
+    spec = pv.model_spec(provider, model)
+    standard, _ = pv.request_fields(
+        provider,
+        model,
+        effort=reasoning_effort,
+        thinking=thinking,
+        temperature=temperature,
+        max_tokens=max_tokens or min(spec.max_output, 8192),
+    )
+    payload = {
+        "model": model,
+        # Cache the frozen instruction prefix. Anthropic's cache is explicit, unlike
+        # DeepSeek's automatic one, so without this every turn of a conversation would
+        # re-pay full price for the whole history.
+        "system": [{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
+        "messages": [*(history or []), {"role": "user", "content": prompt}],
+        "stream": False,
+    }
+    payload.update(standard)
     return payload
 
 
@@ -1183,6 +1428,7 @@ def exception_retry_after(exc: Exception) -> object:
 def call_chat_completion_sdk(
     prompt: str,
     *,
+    provider: str,
     base_url: str,
     api_key: str,
     model: str,
@@ -1192,25 +1438,28 @@ def call_chat_completion_sdk(
     timeout: int,
     max_tokens: int | None,
     max_retries: int,
+    history: list[dict] | None = None,
 ) -> ChatResult:
-    # DEEPSEEK TUNING:
-    # Official docs use the OpenAI SDK and set base_url to the API root, e.g.
-    # https://api.deepseek.com, not https://api.deepseek.com/chat/completions.
-    # You can change model/reasoning/thinking through CLI flags defined below.
+    # base_url is the API root (https://api.deepseek.com), not the /chat/completions
+    # path — that is what every OpenAI-compatible vendor's own docs pass.
     from openai import OpenAI
 
     client = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
-    kwargs = chat_payload(
+    kwargs, extras = chat_payload(
         prompt,
+        provider=provider,
         model=model,
         temperature=temperature,
         reasoning_effort=reasoning_effort,
-        thinking="omit",
+        thinking=thinking,
         max_tokens=max_tokens,
+        history=history,
     )
-    if thinking != "omit":
-        # The OpenAI SDK forwards DeepSeek-specific fields through extra_body.
-        kwargs["extra_body"] = {"thinking": {"type": thinking}}
+    if extras:
+        # Vendor extensions (DeepSeek's `thinking`, GLM's/Qwen's `enable_thinking`) must
+        # go through extra_body — passed as ordinary kwargs the SDK silently discards
+        # them, and the model then answers without thinking at all.
+        kwargs["extra_body"] = extras
 
     last_error: Exception | None = None
     for attempt in range(1, max_retries + 1):
@@ -1221,7 +1470,7 @@ def call_chat_completion_sdk(
             return ChatResult(
                 content=message.content or "",
                 reasoning=getattr(message, "reasoning_content", "") or getattr(message, "reasoning", "") or "",
-                usage=usage,
+                usage=pv.normalize_usage(pv.OPENAI, usage),
                 client_used="sdk",
             )
         except Exception as exc:
@@ -1230,20 +1479,230 @@ def call_chat_completion_sdk(
             if not is_retryable_status(status_code):
                 break
             if attempt < max_retries:
-                time.sleep(retry_delay_seconds(attempt, exception_retry_after(exc)))
+                _sleep_or_cancel(retry_delay_seconds(attempt, exception_retry_after(exc)))
     raise RuntimeError(f"SDK API call failed after {max_retries} attempts: {last_error}")
 
 
-def completion_endpoint(base_url: str) -> str:
+def completion_endpoint(base_url: str, provider: str = pv.DEFAULT_PROVIDER) -> str:
     stripped = base_url.rstrip("/")
+    if pv.get(provider).protocol == pv.ANTHROPIC:
+        return stripped if stripped.endswith("/messages") else f"{stripped}/v1/messages"
     if stripped.endswith("/chat/completions"):
         return stripped
     return f"{stripped}/chat/completions"
 
 
+def auth_headers(provider: str, api_key: str) -> dict:
+    """How this vendor wants to be told who you are.
+
+    Anthropic does not use a Bearer token: the key goes in ``x-api-key`` and the API
+    version is a required header. Sending it the OpenAI way is a 401.
+    """
+    common = {"Content-Type": "application/json", "Accept": "application/json"}
+    if pv.get(provider).protocol == pv.ANTHROPIC:
+        return {**common, "x-api-key": api_key, "anthropic-version": "2023-06-01"}
+    return {**common, "Authorization": f"Bearer {api_key}"}
+
+
+# `max` produces a much longer chain of thought — and reasoning tokens are billed and
+# *counted* as output. This is the trap in 决策 9: with thinking on, a 1200-token cap
+# once left a scoring call literally zero tokens in which to write its JSON, the reply
+# was truncated, and the item was silently ranked as if it had scored zero. Raising the
+# cap along with the effort is not a nicety; without it, `max` would fail every call it
+# was meant to improve.
+MAX_EFFORT_TOKEN_MULTIPLIER = 3
+MAX_EFFORT_TOKEN_CEILING = 64_000
+
+
+def effective_max_tokens(
+    base: int | None,
+    effort: str,
+    provider: str = pv.DEFAULT_PROVIDER,
+    model: str = "",
+) -> int | None:
+    """Grow the output cap when this model is being asked to think its hardest.
+
+    "Hardest" is per-model, not the literal string ``max``: on OpenAI and Claude the deep
+    preset asks for ``xhigh``, whose chain of thought is every bit as long. Comparing
+    against a hardcoded ``"max"`` would leave those two running the deep preset under the
+    shallow preset's cap — 决策 9's bug wearing a new hat.
+
+    A model with no strength dial at all (GLM, Qwen) gets the bigger cap too. We cannot
+    tell from the effort string how long it intends to think, and the asymmetry is stark:
+    a cap that is too high costs nothing (you are billed for tokens produced, not tokens
+    allowed), while one that is too low truncates the JSON and kills the stage.
+
+    Clamped to what the model will actually accept — asking glm-5.2 for 48000 output
+    tokens when it caps at 32000 is just a 400.
+    """
+    if not base:
+        return base
+    spec = pv.model_spec(provider, model)
+    if not pv.is_deepest(effort, provider, model):
+        return min(base, spec.max_output)
+    grown = min(base * MAX_EFFORT_TOKEN_MULTIPLIER, MAX_EFFORT_TOKEN_CEILING)
+    return min(grown, spec.max_output)
+
+
+# --------------------------------------------------------------------------- cancel
+
+
+class Cancelled(Exception):
+    """The teacher pressed 取消."""
+
+
+CANCEL = threading.Event()
+
+# Every HTTPS connection currently waiting on DeepSeek. Cancelling closes them, which
+# is the only way to interrupt a blocking read: the worker threads are parked inside
+# getresponse()/read() and cannot be signalled. Without this, 取消 did nothing until the
+# whole stage finished — minutes, on the explanation stage.
+_LIVE_CONNECTIONS: set = set()
+_CONNECTIONS_LOCK = threading.Lock()
+
+
+def set_cancel_event(event: threading.Event) -> None:
+    """Let the GUI share its own event, so one flag drives the whole run."""
+    global CANCEL
+    CANCEL = event
+
+
+def request_cancel() -> None:
+    CANCEL.set()
+    with _CONNECTIONS_LOCK:
+        connections = list(_LIVE_CONNECTIONS)
+    for connection in connections:
+        # DeepSeek has no "stop generating" endpoint for a non-streaming request, so
+        # hanging up is the abort. Tokens already produced server-side may still be
+        # billed — the UI says so rather than pretending otherwise.
+        #
+        # shutdown() first, and it is not optional: close() only drops this thread's
+        # handle on the socket, and a worker already parked inside recv() on the same fd
+        # stays parked. shutdown(SHUT_RDWR) tears the connection down underneath it and
+        # forces that read to return at once, which is the whole point of 取消.
+        sock = getattr(connection, "sock", None)
+        if sock is not None:
+            with contextlib.suppress(Exception):
+                sock.shutdown(socket.SHUT_RDWR)
+        with contextlib.suppress(Exception):
+            connection.close()
+
+
+def reset_cancel() -> None:
+    CANCEL.clear()
+    with _CONNECTIONS_LOCK:
+        _LIVE_CONNECTIONS.clear()
+
+
+def raise_if_cancelled() -> None:
+    if CANCEL.is_set():
+        raise Cancelled("已取消")
+
+
+def post_json(
+    endpoint: str,
+    payload: dict,
+    headers: dict,
+    *,
+    timeout: int,
+    max_retries: int = 3,
+    insecure_ssl: bool = False,
+) -> dict:
+    """POST one JSON request, over a connection we can hang up on, and retry it.
+
+    Built on ``http.client`` rather than ``urllib.request.urlopen`` for two reasons,
+    both of which the teacher hits in practice:
+
+    * **Cancel.** A worker parked inside ``urlopen`` cannot be interrupted — 取消 did
+      nothing until the whole stage finished. Holding the connection object lets
+      ``request_cancel()`` close the socket from the UI thread, which makes the
+      blocked read raise at once.
+    * **TLS.** This is where the SSL context goes, so a Mac whose network re-signs
+      HTTPS (school proxy, antivirus) verifies against the Keychain instead of
+      failing with "self-signed certificate in certificate chain". See ``net_tls``.
+
+    Every provider goes through here, which is the point: a new vendor gets cancellation
+    and Keychain verification because it cannot avoid them, not because someone
+    remembered to wire them up again.
+    """
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    parts = urllib.parse.urlsplit(endpoint)
+    path = parts.path + (f"?{parts.query}" if parts.query else "")
+
+    last_error: object = None
+    for attempt in range(1, max_retries + 1):
+        raise_if_cancelled()
+        connection = _open_connection(parts, timeout=timeout, insecure_ssl=insecure_ssl)
+        try:
+            connection.request("POST", path, body=data, headers=headers)
+            response = connection.getresponse()
+            body_bytes = response.read()
+
+            if response.status >= 400:
+                detail = body_bytes.decode("utf-8", errors="replace")
+                last_error = f"HTTP {response.status} {response.reason}: {detail or '<empty response body>'}"
+                if not is_retryable_status(response.status):
+                    break
+                if attempt < max_retries:
+                    _sleep_or_cancel(retry_delay_seconds(attempt, response.getheader("Retry-After")))
+                continue
+
+            return json.loads(body_bytes.decode("utf-8"))
+        except Cancelled:
+            raise
+        except (OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
+            # Hanging up on a cancel surfaces here as a broken socket. It is not a
+            # network failure to retry — it is what the teacher asked for.
+            raise_if_cancelled()
+            last_error = exc
+            if net_tls.is_certificate_error(exc):
+                raise RuntimeError(f"{net_tls.CERTIFICATE_HELP}\n（原始错误：{exc}）") from exc
+            if attempt < max_retries:
+                _sleep_or_cancel(retry_delay_seconds(attempt))
+        finally:
+            _close_connection(connection)
+
+    raise RuntimeError(f"API call failed after {max_retries} attempts: {last_error}")
+
+
+def _openai_result(body: dict) -> ChatResult:
+    message = body["choices"][0]["message"]
+    return ChatResult(
+        content=message.get("content") or "",
+        reasoning=message.get("reasoning_content") or message.get("reasoning") or "",
+        usage=pv.normalize_usage(pv.OPENAI, body.get("usage")),
+        client_used="http",
+    )
+
+
+def _anthropic_result(body: dict) -> ChatResult:
+    """Flatten a Messages-API reply into the same ChatResult the rest of the code reads.
+
+    The response is a list of content blocks, not a single string. Thinking arrives as
+    its own block type and must not be concatenated into the answer — the JSON parser
+    downstream would choke on it.
+    """
+    text: list[str] = []
+    reasoning: list[str] = []
+    for block in body.get("content") or []:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text":
+            text.append(block.get("text") or "")
+        elif block.get("type") == "thinking":
+            reasoning.append(block.get("thinking") or "")
+    return ChatResult(
+        content="".join(text),
+        reasoning="".join(reasoning),
+        usage=pv.normalize_usage(pv.ANTHROPIC, body.get("usage")),
+        client_used="http",
+    )
+
+
 def call_chat_completion_http(
     prompt: str,
     *,
+    provider: str = pv.DEFAULT_PROVIDER,
     base_url: str,
     api_key: str,
     model: str,
@@ -1253,52 +1712,111 @@ def call_chat_completion_http(
     timeout: int,
     max_tokens: int | None,
     max_retries: int = 3,
+    history: list[dict] | None = None,
+    insecure_ssl: bool = False,
 ) -> ChatResult:
-    # HTTP fallback mirrors the official curl example. It accepts either the API
-    # root URL or the full /chat/completions endpoint for convenience.
-    payload = chat_payload(
-        prompt,
+    """One completion, in whichever protocol this provider speaks."""
+    spec = pv.get(provider)
+    kwargs = dict(
+        provider=provider,
         model=model,
         temperature=temperature,
         reasoning_effort=reasoning_effort,
         thinking=thinking,
         max_tokens=max_tokens,
+        history=history,
     )
-    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    last_error: Exception | None = None
-    endpoint = completion_endpoint(base_url)
-    for attempt in range(1, max_retries + 1):
-        req = urllib.request.Request(endpoint, data=data, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
-                message = body["choices"][0]["message"]
-                return ChatResult(
-                    content=message.get("content") or "",
-                    reasoning=message.get("reasoning_content") or message.get("reasoning") or "",
-                    usage=body.get("usage"),
-                    client_used="http",
-                )
-        except urllib.error.HTTPError as exc:
-            error_body = ""
-            try:
-                error_body = exc.read().decode("utf-8", errors="replace")
-            except Exception:
-                error_body = ""
-            last_error = f"HTTP {exc.code} {exc.reason}: {error_body or '<empty response body>'}"
-            if not is_retryable_status(exc.code):
-                break
-            if attempt < max_retries:
-                time.sleep(retry_delay_seconds(attempt, exc.headers.get("Retry-After")))
-        except (urllib.error.URLError, http.client.IncompleteRead, http.client.RemoteDisconnected, KeyError, json.JSONDecodeError) as exc:
-            last_error = exc
-            if attempt < max_retries:
-                time.sleep(retry_delay_seconds(attempt))
-    raise RuntimeError(f"API call failed after {max_retries} attempts: {last_error}")
+
+    if spec.protocol == pv.ANTHROPIC:
+        payload = anthropic_payload(prompt, **kwargs)
+        parse = _anthropic_result
+    else:
+        payload, extras = chat_payload(prompt, **kwargs)
+        # Over raw HTTP a vendor extension is just another top-level field; the
+        # extra_body wrapper only exists because the OpenAI SDK needs it.
+        payload.update(extras)
+        parse = _openai_result
+
+    body = post_json(
+        completion_endpoint(base_url, provider),
+        payload,
+        auth_headers(provider, api_key),
+        timeout=timeout,
+        max_retries=max_retries,
+        insecure_ssl=insecure_ssl,
+    )
+    try:
+        return parse(body)
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError(f"{spec.label} 返回了预期之外的结构：{str(body)[:300]}") from exc
+
+
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", ""}
+
+
+def _bypass_proxy(host: str) -> bool:
+    """Should this host skip the proxy?
+
+    ``urllib.request.proxy_bypass`` says *no* for 127.0.0.1 on this Mac — macOS only
+    lists the bypasses the user typed, and nobody types localhost. Sending a loopback
+    address out to a proxy is never what anyone means.
+    """
+    return host in _LOCAL_HOSTS or bool(urllib.request.proxy_bypass(host))
+
+
+def _open_connection(parts, *, timeout: int, insecure_ssl: bool) -> http.client.HTTPConnection:
+    """Connect to the API — through the system proxy, if the machine has one.
+
+    ``urllib.request.urlopen`` did this for free: it reads the proxy out of the
+    environment and out of macOS System Settings. ``http.client`` does not, so moving to
+    it (for cancellation and for the SSL context) silently dropped proxy support. That
+    is not an edge case here: the very machine this is being written on routes through
+    127.0.0.1:1082, and a school network that re-signs TLS — the thing this release
+    exists to fix — is usually re-signing it *at a proxy*. Losing the proxy would have
+    broken exactly the teacher we were trying to unbreak.
+    """
+    host = parts.hostname
+    port = parts.port or (80 if parts.scheme == "http" else 443)
+    context = net_tls.context(insecure_ssl)
+
+    proxy = urllib.request.getproxies().get(parts.scheme)
+    if proxy and not _bypass_proxy(host):
+        # Talk to the proxy, then CONNECT through it; the TLS handshake still happens
+        # against the real host, so verification is unchanged.
+        endpoint = urllib.parse.urlsplit(proxy if "://" in proxy else f"http://{proxy}")
+        if parts.scheme == "https":
+            connection = http.client.HTTPSConnection(
+                endpoint.hostname, endpoint.port or 80, timeout=timeout, context=context
+            )
+        else:
+            connection = http.client.HTTPConnection(endpoint.hostname, endpoint.port or 80, timeout=timeout)
+        connection.set_tunnel(host, port)
+    elif parts.scheme == "http":
+        connection = http.client.HTTPConnection(host, port, timeout=timeout)
+    else:
+        connection = http.client.HTTPSConnection(host, port, timeout=timeout, context=context)
+
+    with _CONNECTIONS_LOCK:
+        _LIVE_CONNECTIONS.add(connection)
+    return connection
+
+
+def _close_connection(connection) -> None:
+    with _CONNECTIONS_LOCK:
+        _LIVE_CONNECTIONS.discard(connection)
+    with contextlib.suppress(Exception):
+        connection.close()
+
+
+def _sleep_or_cancel(seconds: float) -> None:
+    """Back off, but wake immediately on 取消.
+
+    ``time.sleep`` here could park a worker for up to 90 seconds after a 429, and
+    nothing could wake it — pressing 取消 during a rate-limit backoff appeared to do
+    nothing at all.
+    """
+    if CANCEL.wait(seconds):
+        raise Cancelled("已取消")
 
 
 def parse_model_json(content: str) -> dict | str:
@@ -1517,11 +2035,29 @@ JSON 顶层结构：
 """
 
 
-def build_review_select_prompt(candidates: list[dict], target_count: int, section: str) -> str:
+def build_review_select_prompt(
+    candidates: list[dict],
+    target_count: int,
+    section: str,
+    rejected: list[str] | None = None,
+) -> str:
+    # Re-running the review with the same scores and the same model mostly reproduces
+    # the same picks — so "老师对这批不满意" has to be said out loud, or the 重新选题
+    # button looks like it did nothing.
+    reselect = ""
+    if rejected:
+        reselect = f"""
+【重要】老师对上一轮选出的这些题**不满意**，要求换一批：
+{json.dumps(rejected, ensure_ascii=False)}
+请尽量避开它们，从其余候选里另选。只有当某道题确实明显优于所有替代品时，才可以保留它，
+并在 review_reason 里说明为什么非它不可。
+"""
+
     return f"""任务版本：{REVIEW_SELECT_PROMPT_VERSION}
 
 你是一名高三英语教研组长。请在程序按评分初筛出的候选题中，做最终人工式复核选择。
 请严格输出 JSON，不要输出 Markdown，不要添加解释性前后缀。
+{reselect}
 
 JSON 顶层结构：
 {{
@@ -1593,6 +2129,316 @@ JSON 顶层结构：
 """
 
 
+# The two ways to build the handout. Not a right and a wrong one — a teaching choice,
+# so the teacher makes it (基础模式 has the switch):
+#
+#   CHUNKED (完整) — ask about each selected question on its own, then merge. The words
+#       come only from the questions the student is actually holding, so the handout and
+#       the paper match exactly. But the model judges each passage in isolation.
+#
+#   WHOLE (困难) — read the paper end to end and pick from all of it. The model can tell
+#       whether a word is genuinely hard *for this paper*, which is the judgement it is
+#       being asked to make; the cost is that the list can name words from questions the
+#       student's copy does not contain.
+VOCAB_CHUNKED = "chunked"
+VOCAB_WHOLE = "whole"
+VOCAB_MODES = (VOCAB_CHUNKED, VOCAB_WHOLE)
+
+# How many words one *question* may contribute (chunked), against one whole *paper*
+# (whole). A paper is one coherent body of text and deserves one budget; 18 questions
+# each allowed 20 words is why the old handout ran long and repeated itself.
+VOCAB_MAX_ITEM_WORDS = 20
+VOCAB_MAX_ITEM_FORMS = 15
+VOCAB_MAX_READING_WORDS = 40
+VOCAB_MAX_WORD_FORMS = 25
+
+# The largest single vocab reply seen on a real run of the three sample papers at the
+# deep setting: 38,934 output tokens, of which 37,022 (95%) were reasoning. Measured, not
+# guessed — it is what --vocab-max-tokens is sized against, and what tells us in advance
+# that a model with a smaller output ceiling (GLM caps at 32k) may not be able to finish.
+VOCAB_DEEP_OBSERVED_PEAK = 38_934
+
+# Every vocab prompt says the same two things about quotes, and it has to say both.
+# Saying only "don't use English double quotes inside strings" made flash apply the rule
+# to the JSON *syntax* and emit {“word”: “abandon”} — Chinese quotes as delimiters,
+# the whole reply invalid. It really did die on item 9 of a real run (决策 27).
+VOCAB_JSON_RULES = """请严格输出 JSON，不要输出 Markdown，不要输出表格，不要添加解释性前后缀。
+JSON 的语法符号（花括号、方括号、冒号，以及包裹键名和值的引号）必须是标准英文半角字符；
+只有字符串**内部**要引用原文时才用中文引号“”，不要在字符串内部用英文双引号（会让整份输出变成非法 JSON）。
+正确示例：{"word": "abandon", "pos": "v.", "meaning": "放弃"}
+错误示例：{“word”: “abandon”}   ← 键名和值的引号被写成了中文引号，整份 JSON 作废"""
+
+VOCAB_CRITERIA = f"""【任务一：提取重难点阅读词汇】
+筛选标准：
+1. 排除高考英语考纲内的基础词汇（3500 词）。
+2. 挑选出超出考纲，但在高级别英语阅读中复现率较高、对理解文章长难句起关键作用、
+   值得学生积累的词汇（如熟词生义、高级动词、核心抽象名词等）。
+   极僻冷门且无积累价值的专有名词请略过。
+
+【任务二：提取语法词汇变形（重点派生与屈折变化）】
+筛选标准：
+1. 找出文本中具有代表性的词汇变形，特别是那些在高考“语法填空”和“短文改错”题型中极易考查的考点。
+2. 包含但不限于：动词转名词/形容词、形容词转副词/名词、不规则动词的过去式/过去分词、否定前缀等。
+
+JSON 顶层结构：
+{{
+  "reading_words": [
+    {{"word": "英文单词", "pos": "词性", "meaning": "准确的中文释义"}}
+  ],
+  "word_forms": [
+    {{"base": "基础词汇", "base_pos": "词性", "derived": "变形后的词汇",
+      "derived_pos": "变形后的词性", "note": "考点说明（例如：v. 变 n.，加后缀 -tion）"}}
+  ]
+}}
+
+词性统一用缩写：n. / v. / adj. / adv. / prep. / conj. / phr."""
+
+
+def build_vocab_item_prompt(segment: dict) -> str:
+    """完整（分块）: the handout asked one selected question at a time.
+
+    Only the question text is sent — ``segment_body`` never carries the answer key, which
+    is what keeps a student-facing handout clean without anyone having to remember to
+    strip anything.
+
+    The model sees this passage and nothing else, so it cannot weigh a word against the
+    rest of the paper. What it buys instead is exactness: every word on the sheet comes
+    from a question the student is actually holding.
+    """
+    return f"""任务版本：{VOCAB_PROMPT_VERSION}
+
+你是一名高三英语教研老师。请阅读下面的文章，完成两项任务。
+{VOCAB_JSON_RULES}
+
+{VOCAB_CRITERIA}
+
+数量要求：
+- reading_words 最多 {VOCAB_MAX_ITEM_WORDS} 项。
+- word_forms 最多 {VOCAB_MAX_ITEM_FORMS} 项。
+
+题目ID：{segment.get("item_id", "")}
+
+文章正文：
+{segment_body(segment)}
+"""
+
+
+def build_vocab_paper_prompt(paper: str, text: str, *, part: int = 1, total: int = 1) -> str:
+    """困难（整卷）: the handout asked of a whole paper rather than one question.
+
+    The model reads the paper end to end, which is how a teacher would decide, and can
+    therefore tell whether a word is genuinely hard *for this paper*. The passage it is
+    given has already had the answer section cut off (see vocab_one_paper) — unlike the
+    per-question path, that does not come for free here.
+
+    Split into parts only when a paper does not fit the model's context budget. On a
+    1M-window model it never does: 40% of the window is 336k tokens and a paper is about
+    20k, so a paper is one turn. The split matters on a small-window model, and the parts
+    share one conversation so the model still sees what it already picked.
+
+    The answer key is not sent. This is a student handout; nothing that reveals an answer
+    may influence it or leak into it.
+    """
+    scope = "" if total == 1 else f"（这是本卷的第 {part}/{total} 部分，稍后会让你汇总）"
+    return f"""任务版本：{VOCAB_PROMPT_VERSION}
+
+你是一名高三英语教研老师。下面是一整份高考英语模拟卷的正文{scope}。
+请通读全文，站在「这份卷子里哪些词真正值得学生记」的角度，完成两项任务。
+{VOCAB_JSON_RULES}
+
+{VOCAB_CRITERIA}
+
+数量要求：
+- reading_words 最多 {VOCAB_MAX_READING_WORDS} 项。
+- word_forms 最多 {VOCAB_MAX_WORD_FORMS} 项。
+- 同一个词只出现一次；宁可少给几个真正的重难点，也不要凑数。
+
+试卷：{paper}
+
+试卷正文：
+{text}
+"""
+
+
+def build_vocab_merge_prompt(paper: str, parts: int) -> str:
+    """The final turn, when one paper had to be split.
+
+    Asked inside the same conversation, so every part it is merging is already in the
+    history — the prefix is a cache hit and this turn costs almost nothing. Local dedup
+    happens anyway at export time; what this buys is *ranking*, which only a model that
+    has read the whole paper can do.
+    """
+    return f"""任务版本：{VOCAB_PROMPT_VERSION}
+
+以上是同一份试卷「{paper}」分 {parts} 部分给出的候选词汇。
+现在请你把它们合并成这份卷子最终的一张表：
+1. 去重（同一个词只保留一次，保留释义最准确的那条）。
+2. 按「对学生的重难点价值」排序，最值得记的排在最前面。
+3. 删掉其实属于考纲 3500 词的基础词，以及没有积累价值的生僻专有名词。
+
+{VOCAB_JSON_RULES}
+
+数量要求：
+- reading_words 最多 {VOCAB_MAX_READING_WORDS} 项。
+- word_forms 最多 {VOCAB_MAX_WORD_FORMS} 项。
+
+只输出合并后的 JSON，结构与之前每一部分相同（reading_words / word_forms 两个键）。
+"""
+
+
+def chunk_by_tokens(text: str, budget: int) -> list[str]:
+    """Split a paper into pieces that each fit the conversation's token budget.
+
+    Splits on blank lines, then on single lines — never mid-sentence, because a passage
+    cut in half produces vocabulary judgements made on half a sentence.
+
+    The budget has to cover the *whole conversation*, not one turn: every part stays in
+    the history so the model can merge them at the end. So each part gets a fraction of
+    the budget, leaving room for the parts that follow and for their replies.
+
+    Returns one chunk for anything that already fits, which on a 1M-window model is
+    every real paper.
+    """
+    text = text.strip()
+    if not text:
+        return []
+    if count_tokens(text) <= budget:
+        return [text]
+
+    # Room for roughly four parts plus their answers inside one budget. More parts than
+    # that and the merge turn is reasoning over a conversation that is mostly its own
+    # output, which is where quality falls off.
+    per_chunk = max(budget // 5, 2_000)
+
+    chunks: list[str] = []
+    current: list[str] = []
+    current_tokens = 0
+
+    def flush() -> None:
+        nonlocal current, current_tokens
+        if current:
+            chunks.append("\n\n".join(current).strip())
+            current = []
+            current_tokens = 0
+
+    for block in _split_for_chunking(text, per_chunk):
+        block_tokens = count_tokens(block)
+        if current and current_tokens + block_tokens > per_chunk:
+            flush()
+        current.append(block)
+        current_tokens += block_tokens
+    flush()
+    return [chunk for chunk in chunks if chunk]
+
+
+def _split_for_chunking(text: str, limit: int) -> list[str]:
+    """Paragraphs, falling back to lines for a paragraph that is itself too big."""
+    blocks: list[str] = []
+    for paragraph in re.split(r"\n\s*\n", text):
+        paragraph = paragraph.strip()
+        if not paragraph:
+            continue
+        if count_tokens(paragraph) <= limit:
+            blocks.append(paragraph)
+            continue
+        # One enormous paragraph (an unbroken reading passage): fall back to lines. If a
+        # single line still will not fit, it goes out oversized rather than being cut
+        # mid-sentence — a truncated sentence is worse than a slightly-over-budget turn.
+        blocks.extend(line.strip() for line in paragraph.splitlines() if line.strip())
+    return blocks
+
+
+# Which prompt file explains which section. Reading A-D share one: the thinking is
+# the same, only the passage changes.
+EXPLAIN_PROMPT_FILES = {
+    "reading_a": "reading.md",
+    "reading_b": "reading.md",
+    "reading_c": "reading.md",
+    "reading_d": "reading.md",
+    "gap_filling": "gap_filling.md",
+    "cloze": "cloze.md",
+    "grammar": "grammar.md",
+    "practical_writing": "practical_writing.md",
+    "continuation_writing": "continuation_writing.md",
+}
+
+# How many questions to ask for in one turn. Cloze is 15 questions and grammar is
+# 10; asking for all of them at once produced a JSON long enough to run into
+# max_tokens with thinking on (decision 9), and a truncated reply is a hard stop.
+# Reading and 七选五 are 3-5 questions, which fits comfortably in one turn.
+EXPLAIN_CHUNK_SIZE = 5
+
+NO_OFFICIAL_EXPLANATION = "原卷未提供官方解析。请你独立写出完整解析。"
+
+
+def load_explain_prompt(section: str) -> str:
+    """The shared style rules plus this section's own instructions.
+
+    Markdown on disk rather than a string literal in here, so the teacher can read
+    and reword the prompts without touching Python. Placeholders are ``{{NAME}}``
+    (not ``str.format``) because the templates contain literal JSON braces.
+    """
+    filename = EXPLAIN_PROMPT_FILES.get(section)
+    if not filename:
+        raise RuntimeError(f"No explanation prompt for section {section!r}")
+    directory = prompt_dir()
+    style = (directory / "_style.md").read_text(encoding="utf-8")
+    body = (directory / filename).read_text(encoding="utf-8")
+    return f"{style}\n\n---\n\n{body}"
+
+
+def build_explain_prompt(
+    segment: dict,
+    section: str,
+    numbers: list[int],
+    official_explanation: str,
+) -> str:
+    template = load_explain_prompt(section)
+    fields = {
+        "TASK_VERSION": EXPLAIN_PROMPT_VERSION,
+        "SECTION_DISPLAY": section_display(section),
+        "ITEM_ID": str(segment.get("item_id", "")),
+        "QUESTION_NUMBERS": "、".join(str(n) for n in numbers) or "（本题无题号）",
+        "QUESTION_TEXT": segment_body(segment),
+        "ANSWER_KEY": answer_key_text(segment.get("answer_key")),
+        "OFFICIAL_EXPLANATION": official_explanation.strip() or NO_OFFICIAL_EXPLANATION,
+    }
+    for key, value in fields.items():
+        template = template.replace(f"{{{{{key}}}}}", value)
+    return f"任务版本：{EXPLAIN_PROMPT_VERSION}\n\n{template}"
+
+
+def explain_chunks(section: str, numbers: list[int]) -> list[list[int]]:
+    """Split an item's questions into one list per conversation turn."""
+    if not numbers:
+        return [[]]  # writing: no numbered questions, but still one turn
+    if section in {"cloze", "grammar"}:
+        return [numbers[i : i + EXPLAIN_CHUNK_SIZE] for i in range(0, len(numbers), EXPLAIN_CHUNK_SIZE)]
+    return [numbers]
+
+
+# The name a stage is logged under is not always the name of its CLI flag.
+# `review` and `review_select` are both spellings in use — apply_preset says the first,
+# the run logs say the second — so both map to the same flag.
+STAGE_MODEL_FLAG = {
+    "segment": "segment_model",
+    "score": "score_model",
+    "review": "review_model",
+    "review_select": "review_model",
+    "enrich": "enrich_model",
+    "explain": "explain_model",
+    # vocab used to point at enrich_model, which meant the词汇表 ran on whatever the
+    # 备课笔记 stage happened to be set to — and 备课笔记 has had no consumer since
+    # 决策 14. It has its own flag now.
+    "vocab": "vocab_model",
+}
+
+
+def stage_model_name(args: argparse.Namespace, kind: str) -> str:
+    attr = STAGE_MODEL_FLAG.get(kind, f"{kind}_model")
+    return str(getattr(args, attr, None) or getattr(args, "model", ""))
+
+
 def save_api_conversation(
     out_dir: Path,
     kind: str,
@@ -1611,7 +2457,10 @@ def save_api_conversation(
         "",
         "## API",
         "",
-        f"- model: `{getattr(args, kind + '_model', getattr(args, 'model', ''))}`",
+        # "review_select" is logged under that name but its flag is --review-model,
+        # so the naive kind+"_model" lookup silently fell back to args.model and
+        # recorded the wrong model in every review log.
+        f"- model: `{stage_model_name(args, kind)}`",
         f"- client: `{args.client}`",
         f"- base_url: `{args.base_url}`",
         "",
@@ -1659,15 +2508,19 @@ def collect_pdf(input_dir: Path) -> list[Path]:
 def convert_pdfs(args: argparse.Namespace, out_dir: Path) -> list[Path]:
     """OCR any PDFs into .docx so the rest of the pipeline sees only Word files.
 
-    The converted files land under the output directory, never next to the
-    teacher's originals — input is never written to.
+    Both backends produce the same OcrBlock list and go through the same
+    ``blocks_to_docx``, so a MinerU paper and a PaddleOCR paper are laid out identically
+    and everything downstream is unaware there are two.
+
+    The converted files land under the output directory, never next to the teacher's
+    originals — input is never written to.
     """
     pdfs = collect_pdf(Path(args.input))
     if not pdfs:
         return []
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    import pdf_ingest
+    backend = getattr(args, "pdf_backend", "paddle")
 
     converted_dir = out_dir / "pdf_converted"
     ensure_dir(converted_dir)
@@ -1678,13 +2531,92 @@ def convert_pdfs(args: argparse.Namespace, out_dir: Path) -> list[Path]:
             log(args, f"  reusing existing OCR result for {pdf.name}")
             converted.append(target)
             continue
-        log(args, f"  OCR {pdf.name} via PaddleOCR-VL …")
-        converted.append(
-            pdf_ingest.ingest_pdf(
-                pdf, converted_dir, base_url=args.paddle_base_url, token=args.paddle_token
+
+        raise_if_cancelled()
+        if backend == "mineru":
+            import mineru_ingest
+
+            log(args, f"  OCR {pdf.name} via MinerU …")
+            converted.append(
+                mineru_ingest.ingest_pdf(
+                    pdf,
+                    converted_dir,
+                    token=args.mineru_token,
+                    # MinerU is async, so this waits in a poll loop. Route the wait
+                    # through the cancel event or 取消 does nothing until it finishes.
+                    sleep=_sleep_or_cancel,
+                )
             )
-        )
+        else:
+            import pdf_ingest
+
+            log(args, f"  OCR {pdf.name} via PaddleOCR-VL …")
+            converted.append(
+                pdf_ingest.ingest_pdf(
+                    pdf, converted_dir, base_url=args.paddle_base_url, token=args.paddle_token
+                )
+            )
     return converted
+
+
+_LEDGER_LOCK = threading.Lock()
+
+
+def record_usage(
+    args: argparse.Namespace,
+    *,
+    stage: str,
+    item_id: str,
+    model: str,
+    thinking: str,
+    effort: str,
+    result: ChatResult,
+    seconds: float,
+) -> None:
+    """Append one line per API call to ``<out>/usage.jsonl``.
+
+    One ledger, written where the call actually happens, because the alternatives all
+    lied. Cost used to be reconstructed by scanning ``scores/``, ``explanations/`` and
+    ``vocab/`` for embedded usage blocks and recovering the model by *grepping the
+    saved markdown transcripts* — so turning off 保留中间产物 made every run look like
+    it ran on pro, and segment and review-select (which have no per-item output dir)
+    were never counted at all.
+
+    Writing it here also means the durations needed for the time estimate come from
+    the same place as the tokens, rather than being measured twice.
+    """
+    out_dir = getattr(args, "out", "")
+    if not out_dir:
+        return
+    # Already in one shape: every adapter runs its vendor's usage block through
+    # providers.normalize_usage, so nothing here has to know that OpenAI nests the
+    # cached count one level down and Anthropic calls it something else entirely.
+    usage = result.usage if isinstance(result.usage, dict) else {}
+    prompt_tokens = int(usage.get("prompt_tokens") or 0)
+    cache_hit = int(usage.get("prompt_cache_hit_tokens") or 0)
+    entry = {
+        "ts": time.time(),
+        "stage": stage,
+        "item_id": item_id,
+        # Priced per (provider, model): the same model name can exist at two vendors at
+        # two prices, and a run may legitimately switch providers mid-flight.
+        "provider": getattr(args, "provider", pv.DEFAULT_PROVIDER),
+        "model": model,
+        "thinking": thinking,
+        "effort": effort,
+        "prompt_tokens": prompt_tokens,
+        "cache_hit": cache_hit,
+        "cache_miss": int(usage.get("prompt_cache_miss_tokens") or max(prompt_tokens - cache_hit, 0)),
+        "completion_tokens": int(usage.get("completion_tokens") or 0),
+        "reasoning_tokens": int((usage.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0),
+        "seconds": round(seconds, 3),
+    }
+    path = Path(out_dir) / "usage.jsonl"
+    line = json.dumps(entry, ensure_ascii=False) + "\n"
+    with _LEDGER_LOCK:  # every stage writes from a thread pool
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(line)
 
 
 def call_stage_model(
@@ -1695,9 +2627,17 @@ def call_stage_model(
     reasoning_effort: str,
     thinking: str,
     max_tokens: int | None = None,
+    history: list[dict] | None = None,
+    stage: str = "",
+    item_id: str = "",
 ) -> ChatResult:
-    return call_chat_completion(
+    # Checked before the request rather than only between items: on the explanation
+    # stage a single call can run for half a minute, and 取消 has to mean 取消.
+    raise_if_cancelled()
+    started = time.time()
+    result = call_chat_completion(
         prompt,
+        provider=getattr(args, "provider", pv.DEFAULT_PROVIDER),
         base_url=args.base_url,
         api_key=args.api_key or os.environ.get(args.api_key_env, ""),
         model=model,
@@ -1708,7 +2648,166 @@ def call_stage_model(
         timeout=args.timeout,
         max_tokens=max_tokens,
         max_retries=args.max_retries,
+        history=history,
+        insecure_ssl=bool(getattr(args, "insecure_ssl", False)),
     )
+    record_usage(
+        args,
+        stage=stage,
+        item_id=item_id,
+        model=model,
+        thinking=thinking,
+        effort=reasoning_effort,
+        result=result,
+        seconds=time.time() - started,
+    )
+    return result
+
+
+# DeepSeek's context cache is an automatic *prefix* cache, not a session: two
+# requests share cached tokens exactly as far as their message lists are
+# byte-identical from the start. So asking every question of one paper inside a
+# single growing conversation makes each turn's prefix (system + instructions +
+# all previous turns) a cache hit. A hit costs $0.003625/M against $0.435/M for a
+# miss on v4-pro — 120x — so the extra prefix tokens are close to free.
+#
+# How far it may grow is now the model's business, not a constant: 200k was 20% of
+# DeepSeek's 1M window, and means nothing to a 200k-window model. providers.py works
+# it out from the real window — 40% for vocab, 50% elsewhere — because quality falls
+# off long before the window is actually full.
+
+
+class Conversation:
+    """One conversation with one paper's model, reused across turns to keep the cache warm."""
+
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        *,
+        model: str,
+        reasoning_effort: str,
+        thinking: str,
+        stage: str = "",
+    ):
+        self.args = args
+        self.model = model
+        self.reasoning_effort = reasoning_effort
+        self.thinking = thinking
+        self.stage = stage
+        self.history: list[dict] = []
+        self.usages: list[dict] = []
+        self.tokens = 0
+        self.turns = 0
+        self.restarts = 0
+        self.spec = pv.model_spec(getattr(args, "provider", pv.DEFAULT_PROVIDER), model)
+        self.budget = pv.conversation_budget(self.spec, stage)
+
+    def ask(self, prompt: str, *, max_tokens: int | None = None, item_id: str = "") -> ChatResult:
+        if self.tokens >= self.budget:
+            self.history = []
+            self.tokens = 0
+            self.restarts += 1
+
+        result = call_stage_model(
+            self.args,
+            prompt,
+            model=self.model,
+            reasoning_effort=self.reasoning_effort,
+            thinking=self.thinking,
+            max_tokens=max_tokens,
+            history=list(self.history),
+            stage=self.stage,
+            item_id=item_id,
+        )
+        self.history.append({"role": "user", "content": prompt})
+        self.history.append({"role": "assistant", "content": result.content})
+        self.turns += 1
+        usage = result.usage if isinstance(result.usage, dict) else {}
+        self.usages.append(usage)
+
+        # Trust the API's own count, but never *only* it. The previous line was
+        #     self.tokens = int(usage.get("total_tokens") or 0) or self.tokens
+        # which reads as a fallback and behaves as a trap: a turn that comes back with
+        # no usage block leaves the counter frozen at its old value, and once it is
+        # frozen the ceiling can never be reached again. The conversation then grows
+        # without limit — the exact thing the ceiling exists to prevent. Estimating
+        # locally is imprecise; silently not counting at all is worse.
+        reported = int(usage.get("total_tokens") or 0)
+        estimated = self._estimated_tokens()
+        self.tokens = max(reported, estimated)
+        return result
+
+    def _estimated_tokens(self) -> int:
+        """A local floor for the conversation size, for when the API does not say.
+
+        Counted with DeepSeek's tokenizer, so on another vendor it is an approximation —
+        fine for deciding "is this conversation getting too long", useless for billing.
+        Money is only ever read from the usage the API itself reports.
+        """
+        return count_tokens(SYSTEM_PROMPT) + sum(
+            count_tokens(str(message.get("content") or "")) for message in self.history
+        )
+
+
+def require_parsed(
+    parsed: object,
+    chat_result: ChatResult,
+    cap: int | None,
+    kind: str,
+    item_id: str,
+    *,
+    provider: str = "",
+    model: str = "",
+) -> dict:
+    """Reject a reply we could not parse instead of storing the raw text.
+
+    Storing it looked harmless — the field just became ``raw_score`` — but every
+    downstream reader then saw a missing novelty/difficulty score and ranked the
+    question as a zero. A truncated reply must stop the run, not quietly change
+    which questions the teacher gets.
+    """
+    if isinstance(parsed, dict):
+        return parsed
+
+    usage = chat_result.usage if isinstance(chat_result.usage, dict) else {}
+    produced = int(usage.get("completion_tokens") or 0)
+    if cap and produced >= cap:
+        reasoning = int((usage.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0)
+        share = f"{100 * reasoning / produced:.0f}%" if produced else "?"
+
+        # Name the lever that exists on *this* model. A measured run had vocab spending
+        # 94% of its output on reasoning, and when that is what happened the cure is a
+        # shallower effort, not a bigger budget — a bigger budget just buys a longer
+        # chain of thought (决策 31). But GLM has no strength dial at all, and telling its
+        # user to "lower the effort" would send them looking for a control that is not
+        # there; on those models the only lever is thinking itself.
+        spec = pv.model_spec(provider or pv.DEFAULT_PROVIDER, model)
+        if spec.efforts:
+            lever = f"  思考占了大半 → 把强度降一档最有效：--{kind}-reasoning-effort {spec.efforts[0]}"
+        else:
+            lever = f"  这个模型没有强度档，只能关掉思考：--{kind}-thinking disabled"
+
+        headroom = ""
+        if cap >= spec.max_output:
+            headroom = (
+                f"\n  注意：{spec.id} 的输出上限就是 {spec.max_output}，已经顶到头了，"
+                f"调高 --{kind}-max-tokens 不会有任何作用。"
+            )
+
+        raise RuntimeError(
+            f"{kind} 输出被 max_tokens={cap} 截断，JSON 不完整：{item_id}\n"
+            f"  这次调用产生了 {produced} tokens，其中 {reasoning}（{share}）是思考。\n"
+            f"{lever}\n"
+            f"  确实是答案太长 → 才该调高 --{kind}-max-tokens。{headroom}"
+        )
+    raise RuntimeError(f"{kind} 返回的不是合法 JSON：{item_id}（前 200 字：{str(parsed)[:200]}）")
+
+
+def cache_hit_ratio(usages: list[dict]) -> tuple[int, int]:
+    """Return (cached prompt tokens, total prompt tokens) across calls."""
+    cached = sum(int(u.get("prompt_cache_hit_tokens") or 0) for u in usages if isinstance(u, dict))
+    total = sum(int(u.get("prompt_tokens") or 0) for u in usages if isinstance(u, dict))
+    return cached, total
 
 
 def flatten_score(row: dict) -> dict:
@@ -1779,6 +2878,9 @@ def segment_docx_file(
     out_dir: Path,
     extra_starts: list[tuple[int, str, str]] | None = None,
 ) -> list[dict]:
+    # Local segmentation is fast (well under a second per paper), so checking between
+    # papers is effectively instant — 取消 needs no confirmation on this stage.
+    raise_if_cancelled()
     extracted_dir = out_dir / "extracted_text"
     segments_dir = out_dir / "segments"
     rough_dir = out_dir / "rough_segments"
@@ -1848,6 +2950,8 @@ def segment_docx_file(
             reasoning_effort=args.segment_reasoning_effort,
             thinking=args.segment_thinking,
             max_tokens=args.segment_max_tokens,
+            stage="segment",
+            item_id=unit["unit_id"],
         )
         save_api_conversation(out_dir, "segment", unit["unit_id"], prompt, chat_result, args)
 
@@ -1935,6 +3039,8 @@ def run_segment(args: argparse.Namespace) -> list[dict]:
                 doc_rows = future.result()
                 rows.extend(doc_rows)
                 log(args, f"  segmented {docx.name}: {len(doc_rows)} item(s).")
+            except Cancelled:
+                raise
             except Exception as exc:
                 log(args, f"  segment failed for {docx.name}: {exc}")
                 raise
@@ -1983,6 +3089,8 @@ def run_segment(args: argparse.Namespace) -> list[dict]:
                         reasoning_effort=args.segment_reasoning_effort,
                         thinking=args.segment_thinking,
                         max_tokens=200,  # the reply is a single number
+                        stage="segment",
+                        item_id=doc_name,
                     ).content
 
                 extra = locate_missing_sections(
@@ -2085,6 +3193,7 @@ def load_segment_rows(out_dir: Path) -> list[dict]:
 
 
 def score_one_segment(row: dict, args: argparse.Namespace, out_dir: Path) -> dict:
+    raise_if_cancelled()
     scores_dir = out_dir / "scores"
     ensure_dir(scores_dir)
     item_id = row["item_id"]
@@ -2106,10 +3215,12 @@ def score_one_segment(row: dict, args: argparse.Namespace, out_dir: Path) -> dic
         reasoning_effort=args.score_reasoning_effort,
         thinking=args.score_thinking,
         max_tokens=args.score_max_tokens,
+        stage="score",
+        item_id=item_id,
     )
     save_api_conversation(out_dir, "score", item_id, prompt, chat_result, args)
     parsed = parse_model_json(chat_result.content)
-    score = parsed if isinstance(parsed, dict) else {"raw_score": str(parsed)}
+    score = require_parsed(parsed, chat_result, args.score_max_tokens, "score", item_id)
     score.setdefault("item_id", item_id)
     score.setdefault("source_doc", row.get("source_doc", ""))
     score.setdefault("section", row.get("display_section", row.get("section", "")))
@@ -2124,6 +3235,10 @@ def score_one_segment(row: dict, args: argparse.Namespace, out_dir: Path) -> dic
         "score_path": str(score_path),
         "score": score,
         "usage": chat_result.usage,
+        # Without this the cost report has to recover the model by grepping the
+        # saved conversation logs — and with 保留中间产物 off there are none, so it
+        # assumed pro and billed a flash run at roughly 3x its real price.
+        "model": stage_model_name(args, "score"),
         "client_used": chat_result.client_used,
         "prompt_version": SCORE_PROMPT_VERSION,
     }
@@ -2139,6 +3254,16 @@ def run_score(args: argparse.Namespace) -> list[dict]:
     rows = load_segment_rows(out_dir)
     log(args, f"Scoring {len(rows)} segment(s) with {args.score_model}; workers={args.score_workers}.")
     results: list[dict] = []
+
+    # Scoring shares a long, identical instruction prefix across every call, but
+    # firing all 16 workers at once means all 16 miss the cache — there is nothing
+    # to hit yet. Sending the first call alone writes that prefix into DeepSeek's
+    # cache, and the rest then read it.
+    if rows:
+        results.append(score_one_segment(rows[0], args, out_dir))
+        log(args, f"  scored {rows[0]['item_id']} (1/{len(rows)})  [预热缓存]")
+        rows = rows[1:]
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.score_workers)) as executor:
         future_map = {executor.submit(score_one_segment, row, args, out_dir): row for row in rows}
         for future in concurrent.futures.as_completed(future_map):
@@ -2146,10 +3271,16 @@ def run_score(args: argparse.Namespace) -> list[dict]:
             try:
                 result = future.result()
                 results.append(result)
-                log(args, f"  scored {row['item_id']} ({len(results)}/{len(rows)})")
+                log(args, f"  scored {row['item_id']} ({len(results)}/{len(rows) + 1})")
+            except Cancelled:
+                raise
             except Exception as exc:
                 log(args, f"  score failed for {row['item_id']}: {exc}")
                 raise
+
+    cached, total = cache_hit_ratio([r.get("usage") for r in results])
+    if total:
+        log(args, f"  prompt cache: {cached}/{total} tokens hit ({100 * cached / total:.0f}%)")
 
     results.sort(key=lambda r: (r["source_doc"], section_order(r["section"]), r["item_id"]))
     score_index = out_dir / "score_index.jsonl"
@@ -2293,6 +3424,26 @@ def run_review_select(args: argparse.Namespace) -> list[dict]:
     review_records: list[dict] = []
     log(args, f"Review-select with {args.review_model}; candidates per section={args.review_candidates}.")
 
+    # --reselect means "the teacher looked at this batch and wants different questions".
+    # The picks the model is being asked to move away from are the ones currently on
+    # disk — without naming them, the same scores and the same model just choose the
+    # same questions again and the 重新选题 button appears to do nothing.
+    previous: dict[str, list[str]] = {}
+    if getattr(args, "reselect", False):
+        current = read_json(out_dir / "selected_items.json")
+        if isinstance(current, list):
+            for row in current:
+                if isinstance(row, dict):
+                    previous.setdefault(str(row.get("section", "")), []).append(str(row.get("item_id", "")))
+        if previous:
+            log(args, f"  重新选题：避开上一轮选中的 {sum(len(v) for v in previous.values())} 道题。")
+            # With 3 papers there are only 3 candidates per section and 2 are wanted,
+            # so at most one question per section *can* change. Say so, rather than
+            # letting the teacher press the button again and again.
+            per_section = len(score_rows) / max(1, len(SELECTION_TARGETS))
+            if per_section <= max(SELECTION_TARGETS.values()) + 1:
+                log(args, "  提示：候选题不多，每个题型最多只能换掉一道。想换得更彻底，请多放几份试卷。")
+
     for section, target_count in SELECTION_TARGETS.items():
         candidates = [row for row in score_rows if row.get("section") == section]
         for row in candidates:
@@ -2307,7 +3458,12 @@ def run_review_select(args: argparse.Namespace) -> list[dict]:
             chosen_ids = [row["item_id"] for row in shortlist]
             review = {"section": section_display(section), "selected_item_ids": chosen_ids, "review_reason": "候选数量不超过目标数量，全部入选。", "items": []}
         else:
-            prompt = build_review_select_prompt([candidate_summary(row) for row in shortlist], target_count, section)
+            prompt = build_review_select_prompt(
+                [candidate_summary(row) for row in shortlist],
+                target_count,
+                section,
+                rejected=previous.get(section),
+            )
             chat_result = call_stage_model(
                 args,
                 prompt,
@@ -2315,6 +3471,8 @@ def run_review_select(args: argparse.Namespace) -> list[dict]:
                 reasoning_effort=args.review_reasoning_effort,
                 thinking=args.review_thinking,
                 max_tokens=args.review_max_tokens,
+                stage="review_select",
+                item_id=section,
             )
             save_api_conversation(out_dir, "review_select", section, prompt, chat_result, args)
             parsed = parse_model_json(chat_result.content)
@@ -2375,7 +3533,13 @@ def run_review_select(args: argparse.Namespace) -> list[dict]:
     return final_selected
 
 
-def enrich_one_selected(row: dict, args: argparse.Namespace, out_dir: Path) -> dict:
+def enrich_one_selected(
+    row: dict,
+    args: argparse.Namespace,
+    out_dir: Path,
+    conversation: "Conversation | None" = None,
+) -> dict:
+    raise_if_cancelled()
     enrich_dir = out_dir / "enrichments"
     ensure_dir(enrich_dir)
     item_id = row["item_id"]
@@ -2392,17 +3556,22 @@ def enrich_one_selected(row: dict, args: argparse.Namespace, out_dir: Path) -> d
         raise RuntimeError(f"Invalid segment file for {item_id}")
     score = row.get("score", {}) if isinstance(row.get("score"), dict) else {}
     prompt = build_enrich_prompt(segment, score)
-    chat_result = call_stage_model(
-        args,
-        prompt,
-        model=args.enrich_model,
-        reasoning_effort=args.enrich_reasoning_effort,
-        thinking=args.enrich_thinking,
-        max_tokens=args.enrich_max_tokens,
-    )
+    if conversation is not None:
+        chat_result = conversation.ask(prompt, max_tokens=args.enrich_max_tokens, item_id=item_id)
+    else:
+        chat_result = call_stage_model(
+            args,
+            prompt,
+            model=args.enrich_model,
+            reasoning_effort=args.enrich_reasoning_effort,
+            thinking=args.enrich_thinking,
+            max_tokens=args.enrich_max_tokens,
+            stage="enrich",
+            item_id=item_id,
+        )
     save_api_conversation(out_dir, "enrich", item_id, prompt, chat_result, args)
     parsed = parse_model_json(chat_result.content)
-    enrichment = parsed if isinstance(parsed, dict) else {"raw_enrichment": str(parsed)}
+    enrichment = require_parsed(parsed, chat_result, args.enrich_max_tokens, "enrich", item_id)
     enrichment.setdefault("item_id", item_id)
     result = {
         "item_id": item_id,
@@ -2412,6 +3581,7 @@ def enrich_one_selected(row: dict, args: argparse.Namespace, out_dir: Path) -> d
         "item_label": row.get("item_label", ""),
         "enrichment": enrichment,
         "usage": chat_result.usage,
+        "model": stage_model_name(args, "enrich"),
         "client_used": chat_result.client_used,
         "prompt_version": ENRICH_PROMPT_VERSION,
     }
@@ -2419,6 +3589,413 @@ def enrich_one_selected(row: dict, args: argparse.Namespace, out_dir: Path) -> d
     row["enrichment"] = enrichment
     row["enrichment_path"] = str(enrich_path)
     return row
+
+
+def paper_text_path(out_dir: Path, source_doc: str) -> Path:
+    """Where the segment stage already dumped this paper's plain text."""
+    return out_dir / "extracted_text" / f"{safe_stem(source_doc)}.txt"
+
+
+def vocab_row_mode(row: dict) -> str:
+    """Which mode produced this word-list row.
+
+    Prefer what the row says. A row written before the switch existed has no ``vocab_mode``
+    at all, so fall back to its *shape*, which cannot lie: 完整 is keyed by question and
+    carries an ``item_id``; 困难 is keyed by paper and does not. Defaulting to one or the
+    other instead would silently misread half the word lists already on disk.
+    """
+    mode = str(row.get("vocab_mode") or "")
+    if mode in VOCAB_MODES:
+        return mode
+    return VOCAB_CHUNKED if row.get("item_id") else VOCAB_WHOLE
+
+
+def vocab_dir_for(out_dir: Path, mode: str) -> Path:
+    """Cached word lists, one directory per mode.
+
+    Kept apart on purpose. The two modes key their cache differently (by question vs by
+    paper) and produce differently-shaped rows, so sharing a directory would let a
+    half-finished run of one mode be silently reused by the other.
+    """
+    return out_dir / "vocab" / mode
+
+
+def vocab_one_selected(
+    row: dict,
+    args: argparse.Namespace,
+    out_dir: Path,
+    conversation: "Conversation | None" = None,
+) -> dict:
+    """完整（分块）: one selected question's word list.
+
+    The answer key never reaches the model here, because ``segment_body`` does not carry
+    it — a property the whole-paper path has to work for (see vocab_one_paper).
+    """
+    raise_if_cancelled()
+    vocab_dir = vocab_dir_for(out_dir, VOCAB_CHUNKED)
+    ensure_dir(vocab_dir)
+    item_id = row["item_id"]
+    vocab_path = vocab_dir / f"{safe_filename(item_id)}.json"
+    if vocab_path.exists() and not args.force:
+        existing = read_json(vocab_path)
+        if isinstance(existing, dict):
+            return existing
+
+    segment = read_json(Path(row["segment_path"]))
+    if not isinstance(segment, dict):
+        raise RuntimeError(f"Invalid segment file for {item_id}")
+
+    model = stage_model_name(args, "vocab")
+    prompt = build_vocab_item_prompt(segment)
+    # One repair turn, as the explanations get: a word list is dozens of entries of free
+    # Chinese text, and one unescaped quote anywhere in it makes the whole reply
+    # unparseable. It killed this stage 16 items into a real run (决策 27).
+    parsed, chat_result, turn_usages = ask_for_json(
+        conversation,
+        args,
+        prompt,
+        model=model,
+        reasoning_effort=args.vocab_reasoning_effort,
+        thinking=args.vocab_thinking,
+        max_tokens=args.vocab_max_tokens,
+        stage="vocab",
+        item_id=item_id,
+    )
+    save_api_conversation(out_dir, "vocab", item_id, prompt, chat_result, args)
+    vocab = require_parsed(
+        parsed, chat_result, args.vocab_max_tokens, "vocab", item_id,
+        provider=args.provider, model=model,
+    )
+    result = {
+        "vocab_mode": VOCAB_CHUNKED,
+        "item_id": item_id,
+        "source_doc": row.get("source_doc", ""),
+        "section": row.get("section", ""),
+        "display_section": row.get("display_section", ""),
+        "item_label": row.get("item_label", ""),
+        "reading_words": vocab.get("reading_words", []),
+        "word_forms": vocab.get("word_forms", []),
+        # Both turns, when a repair was needed: the retry alone would under-report what
+        # the item actually cost.
+        "usage": merge_usages(turn_usages),
+        "model": model,
+        "client_used": chat_result.client_used,
+        "prompt_version": VOCAB_PROMPT_VERSION,
+    }
+    write_json(vocab_path, result)
+    return result
+
+
+def vocab_one_paper(
+    source_doc: str,
+    args: argparse.Namespace,
+    out_dir: Path,
+) -> dict:
+    """困难（整卷）: one paper's word list, read from the paper's full text.
+
+    Keyed by paper, not by question: the words belong to the paper, so re-picking the
+    questions no longer makes the handout stale. That also means changing the selection
+    does not force this to run again — see assert_selection_is_complete.
+    """
+    raise_if_cancelled()
+    vocab_dir = vocab_dir_for(out_dir, VOCAB_WHOLE)
+    ensure_dir(vocab_dir)
+    stem = safe_stem(source_doc)
+    vocab_path = vocab_dir / f"{stem}.json"
+    if vocab_path.exists() and not args.force:
+        existing = read_json(vocab_path)
+        if isinstance(existing, dict):
+            return existing
+
+    text_path = paper_text_path(out_dir, source_doc)
+    if not text_path.exists():
+        raise SystemExit(
+            f"Missing {text_path}. 「困难（整卷）」模式读整卷正文，请先跑 --mode segment。"
+        )
+    raw = text_path.read_text(encoding="utf-8")
+
+    # The extracted text is the *whole* docx, answer section and all. This handout goes
+    # to students, so the answer area has to come off before the model ever sees it —
+    # the old per-question prompt got this for free by sending only segment_body.
+    # Two distinct reasons, and the second is the one that would have been missed:
+    #   * 答案绝不能进学生版 (CLAUDE.md). Only words reach the docx, but nothing that
+    #     reveals an answer should be able to influence a student-facing artefact.
+    #   * the answer area contains 参考范文 — model essays the students' paper does not
+    #     have. Words mined from those are words from a text the student cannot read.
+    # trim_answer_tail_from_text is 决策 6's boundary: the minimum of every candidate,
+    # not the first one that matches.
+    text = trim_answer_tail_from_text(raw).strip()
+    if not text:
+        raise RuntimeError(f"{source_doc}: 抽出的正文是空的，无法提词。")
+    if len(text) < len(raw.strip()):
+        log(args, f"  vocab {source_doc}: 已去掉答案区（{len(raw.strip()) - len(text):,} 字）")
+
+    model = stage_model_name(args, "vocab")
+    conversation = Conversation(
+        args,
+        model=model,
+        reasoning_effort=args.vocab_reasoning_effort,
+        thinking=args.vocab_thinking,
+        stage="vocab",
+    )
+
+    chunks = chunk_by_tokens(text, conversation.budget)
+    log(args, f"  vocab {source_doc}: {count_tokens(text):,} tokens → {len(chunks)} 轮")
+
+    parts: list[dict] = []
+    usages: list[dict] = []
+    last_result: ChatResult | None = None
+
+    for index, chunk in enumerate(chunks, start=1):
+        prompt = build_vocab_paper_prompt(source_doc, chunk, part=index, total=len(chunks))
+        # One repair turn, as the explanations get: a word list is dozens of entries of
+        # free Chinese text, and one unescaped quote anywhere in it makes the whole reply
+        # unparseable. It killed this stage 16 items into a real run (决策 27).
+        parsed, chat_result, turn_usages = ask_for_json(
+            conversation,
+            args,
+            prompt,
+            model=model,
+            reasoning_effort=args.vocab_reasoning_effort,
+            thinking=args.vocab_thinking,
+            max_tokens=args.vocab_max_tokens,
+            stage="vocab",
+            item_id=stem,
+        )
+        suffix = "" if len(chunks) == 1 else f"__part{index}"
+        save_api_conversation(out_dir, "vocab", f"{stem}{suffix}", prompt, chat_result, args)
+        parts.append(require_parsed(
+            parsed, chat_result, args.vocab_max_tokens, "vocab", source_doc,
+            provider=args.provider, model=model,
+        ))
+        usages.extend(turn_usages)
+        last_result = chat_result
+
+    if len(chunks) > 1:
+        # Merge inside the same conversation: every part is already in the history, so
+        # the prefix is a cache hit and this turn is nearly free. Local dedup happens at
+        # export anyway — what this buys is ranking across the whole paper, which only a
+        # model that has read all of it can do.
+        prompt = build_vocab_merge_prompt(source_doc, len(chunks))
+        parsed, chat_result, turn_usages = ask_for_json(
+            conversation,
+            args,
+            prompt,
+            model=model,
+            reasoning_effort=args.vocab_reasoning_effort,
+            thinking=args.vocab_thinking,
+            max_tokens=args.vocab_max_tokens,
+            stage="vocab",
+            item_id=f"{stem}__merge",
+        )
+        save_api_conversation(out_dir, "vocab", f"{stem}__merge", prompt, chat_result, args)
+        merged = require_parsed(
+            parsed, chat_result, args.vocab_max_tokens, "vocab", source_doc,
+            provider=args.provider, model=model,
+        )
+        usages.extend(turn_usages)
+        last_result = chat_result
+        vocab = merged
+    else:
+        vocab = parts[0]
+
+    result = {
+        "vocab_mode": VOCAB_WHOLE,
+        "source_doc": source_doc,
+        "reading_words": vocab.get("reading_words", []),
+        "word_forms": vocab.get("word_forms", []),
+        "parts": len(chunks),
+        # Every turn, not just the last: the merge turn alone would under-report what the
+        # paper actually cost.
+        "usage": merge_usages(usages),
+        "model": model,
+        "client_used": last_result.client_used if last_result else "",
+        "prompt_version": VOCAB_PROMPT_VERSION,
+        "cache": cache_hit_ratio(conversation.usages),
+    }
+    write_json(vocab_path, result)
+    return result
+
+
+def vocab_papers(out_dir: Path) -> list[str]:
+    """Which papers need a word list: the ones that contributed a selected question.
+
+    Read from the selection rather than from the input folder, so a paper nobody used
+    is not paid for. But the *unit* is the paper, not the question.
+    """
+    selection_path = out_dir / "selected_items.json"
+    if not selection_path.exists():
+        raise SystemExit(f"Missing {selection_path}. Run --mode select first.")
+    selected = read_json(selection_path)
+    if not isinstance(selected, list):
+        raise SystemExit(f"Invalid {selection_path}")
+    papers = {str(row.get("source_doc", "")) for row in selected if row.get("source_doc")}
+    return sorted(papers)
+
+
+def warn_if_output_ceiling_is_too_low(args: argparse.Namespace, model: str) -> None:
+    """Say it before spending four minutes discovering it.
+
+    A measured run of the whole-paper mode at the deep setting produced up to 38,934
+    output tokens for one paper — 94% of it reasoning. A model whose entire output ceiling
+    sits below that cannot finish the job at this setting, and the failure would otherwise
+    arrive as a truncation error long after the teacher walked away.
+
+    Only for the whole-paper mode: 完整（分块）feeds one question at a time, so a single
+    reply is a fraction of that size and this warning would be crying wolf.
+    """
+    if args.vocab_mode != VOCAB_WHOLE:
+        return
+    spec = pv.model_spec(args.provider, model)
+    if not pv.is_deepest(args.vocab_reasoning_effort, args.provider, model):
+        return
+    if spec.max_output >= VOCAB_DEEP_OBSERVED_PEAK:
+        return
+
+    lever = (
+        f"--vocab-reasoning-effort {spec.efforts[0]}" if spec.efforts
+        else "--vocab-thinking disabled"
+    )
+    log(
+        args,
+        f"  ⚠️ {spec.id} 的输出上限是 {spec.max_output:,}，而「困难（整卷）」深度思考实测最多要 "
+        f"{VOCAB_DEEP_OBSERVED_PEAK:,}。可能会被截断。\n"
+        f"     若报「被 max_tokens 截断」，请改用：{lever}，或换成「完整（分块）」模式。",
+    )
+
+
+def _run_vocab_chunked(args: argparse.Namespace, out_dir: Path, model: str) -> list[dict]:
+    """完整（分块）: one call per selected question, papers in parallel.
+
+    One conversation per paper, questions asked into it in turn, so each turn's prefix
+    (system + every previous question of that paper) is a cache hit — 决策 8.
+    """
+    selection_path = out_dir / "selected_items.json"
+    if not selection_path.exists():
+        raise SystemExit(f"Missing {selection_path}. Run --mode select first.")
+    selected = read_json(selection_path)
+    if not isinstance(selected, list):
+        raise SystemExit(f"Invalid {selection_path}")
+
+    by_paper: dict[str, list[dict]] = {}
+    for row in selected:
+        by_paper.setdefault(str(row.get("source_doc", "")), []).append(row)
+
+    log(args, f"「完整（分块）」：逐题提词，{len(selected)} 道题 / {len(by_paper)} 份卷，模型 {model}。")
+
+    results: list[dict] = []
+    conversations: list[Conversation] = []
+    done = 0
+    lock = threading.Lock()
+
+    def vocab_paper(rows: list[dict]) -> list[dict]:
+        nonlocal done
+        conversation = Conversation(
+            args,
+            model=model,
+            reasoning_effort=args.vocab_reasoning_effort,
+            thinking=args.vocab_thinking,
+            stage="vocab",
+        )
+        with lock:
+            conversations.append(conversation)
+        out: list[dict] = []
+        for row in rows:
+            out.append(vocab_one_selected(row, args, out_dir, conversation=conversation))
+            with lock:
+                done += 1
+                log(args, f"  vocab {row['item_id']} ({done}/{len(selected)})")
+        return out
+
+    workers = max(1, min(args.enrich_workers, len(by_paper)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        future_map = {executor.submit(vocab_paper, rows): doc for doc, rows in by_paper.items()}
+        for future in concurrent.futures.as_completed(future_map):
+            doc = future_map[future]
+            try:
+                results.extend(future.result())
+            except Cancelled:
+                raise
+            except Exception as exc:
+                log(args, f"  vocab failed for {doc}: {exc}")
+                raise
+
+    cached, total = cache_hit_ratio([u for c in conversations for u in c.usages])
+    if total:
+        log(args, f"  prompt cache: {cached}/{total} tokens hit ({100 * cached / total:.0f}%)")
+
+    results.sort(key=lambda r: (section_order(r.get("section", "")), r.get("source_doc", ""), r.get("item_id", "")))
+    return results
+
+
+def _run_vocab_whole(args: argparse.Namespace, out_dir: Path, model: str) -> list[dict]:
+    """困难（整卷）: one conversation per paper, reading the paper end to end."""
+    papers = vocab_papers(out_dir)
+    log(args, f"「困难（整卷）」：通读整卷提词，{len(papers)} 份卷，模型 {model}。")
+
+    results: list[dict] = []
+    done = 0
+    lock = threading.Lock()
+
+    def one(source_doc: str) -> dict:
+        nonlocal done
+        result = vocab_one_paper(source_doc, args, out_dir)
+        with lock:
+            done += 1
+            log(args, f"  vocab {source_doc} ({done}/{len(papers)})")
+        return result
+
+    # Papers in parallel, each in its own conversation. Not one conversation for
+    # everything: a single 40%-of-context conversation would be slow and would blur one
+    # paper's vocabulary into the next.
+    workers = max(1, min(args.enrich_workers, len(papers)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        future_map = {executor.submit(one, doc): doc for doc in papers}
+        for future in concurrent.futures.as_completed(future_map):
+            doc = future_map[future]
+            try:
+                results.append(future.result())
+            except Cancelled:
+                raise
+            except Exception as exc:
+                log(args, f"  vocab failed for {doc}: {exc}")
+                raise
+
+    cached = sum(int(r.get("cache", (0, 0))[0]) for r in results)
+    total = sum(int(r.get("cache", (0, 0))[1]) for r in results)
+    if total:
+        log(args, f"  prompt cache: {cached}/{total} tokens hit ({100 * cached / total:.0f}%)")
+
+    results.sort(key=lambda r: r.get("source_doc", ""))
+    return results
+
+
+def run_vocab(args: argparse.Namespace) -> list[dict]:
+    """The student handout, built whichever way the teacher asked for.
+
+    Not a right way and a wrong way — a teaching choice, so 基础模式 puts the switch in
+    front of her rather than this file deciding for her:
+
+    * 完整（分块）— the words come only from the questions she is handing out.
+    * 困难（整卷）— the model reads the whole paper and picks the genuinely hard ones.
+    """
+    out_dir = Path(args.out)
+    api_key = args.api_key or os.environ.get(args.api_key_env)
+    if not api_key:
+        raise SystemExit(f"Missing API key. Set {args.api_key_env} or pass --api-key.")
+
+    model = stage_model_name(args, "vocab")
+    warn_if_output_ceiling_is_too_low(args, model)
+
+    if args.vocab_mode == VOCAB_CHUNKED:
+        results = _run_vocab_chunked(args, out_dir, model)
+    else:
+        results = _run_vocab_whole(args, out_dir, model)
+
+    vocab_index = out_dir / "vocab_index.json"
+    write_json(vocab_index, results)
+    log(args, f"Vocabulary outputs written: {vocab_index} ({file_size_label(vocab_index)})")
+    return results
 
 
 def run_enrich_selected(args: argparse.Namespace) -> list[dict]:
@@ -2433,19 +4010,58 @@ def run_enrich_selected(args: argparse.Namespace) -> list[dict]:
     if not isinstance(selected, list):
         raise SystemExit(f"Invalid {selection_path}")
 
-    log(args, f"Enriching {len(selected)} selected item(s) with {args.enrich_model}; workers={args.enrich_workers}.")
+    # One conversation per paper: the questions of a paper are asked in sequence
+    # inside it, so every turn after the first re-reads a cached prefix instead of
+    # paying full price for the instruction block. Papers stay parallel, so the
+    # wall-clock cost is one paper's worth of turns, not the whole run's.
+    by_paper: dict[str, list[dict]] = {}
+    for row in selected:
+        by_paper.setdefault(str(row.get("source_doc", "")), []).append(row)
+
+    log(
+        args,
+        f"Enriching {len(selected)} selected item(s) with {args.enrich_model}; "
+        f"{len(by_paper)} conversation(s), one per paper.",
+    )
     results: list[dict] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.enrich_workers)) as executor:
-        future_map = {executor.submit(enrich_one_selected, row, args, out_dir): row for row in selected}
+    conversations: list[Conversation] = []
+    done = 0
+    lock = threading.Lock()
+
+    def enrich_paper(rows: list[dict]) -> list[dict]:
+        nonlocal done
+        conversation = Conversation(
+            args,
+            model=args.enrich_model,
+            reasoning_effort=args.enrich_reasoning_effort,
+            thinking=args.enrich_thinking,
+            stage="enrich",
+        )
+        with lock:
+            conversations.append(conversation)
+        out: list[dict] = []
+        for row in rows:
+            out.append(enrich_one_selected(row, args, out_dir, conversation=conversation))
+            with lock:
+                done += 1
+                log(args, f"  enriched {row['item_id']} ({done}/{len(selected)})")
+        return out
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(args.enrich_workers, len(by_paper)))) as executor:
+        future_map = {executor.submit(enrich_paper, rows): doc for doc, rows in by_paper.items()}
         for future in concurrent.futures.as_completed(future_map):
-            row = future_map[future]
+            doc = future_map[future]
             try:
-                result = future.result()
-                results.append(result)
-                log(args, f"  enriched {row['item_id']} ({len(results)}/{len(selected)})")
-            except Exception as exc:
-                log(args, f"  enrich failed for {row['item_id']}: {exc}")
+                results.extend(future.result())
+            except Cancelled:
                 raise
+            except Exception as exc:
+                log(args, f"  enrich failed for {doc}: {exc}")
+                raise
+
+    cached, total = cache_hit_ratio([u for c in conversations for u in c.usages])
+    if total:
+        log(args, f"  prompt cache: {cached}/{total} tokens hit ({100 * cached / total:.0f}%)")
 
     results.sort(key=lambda r: (section_order(r.get("section", "")), r.get("source_doc", ""), r.get("item_id", "")))
     enriched_path = out_dir / "selected_items.enriched.json"
@@ -2455,68 +4071,539 @@ def run_enrich_selected(args: argparse.Namespace) -> list[dict]:
     return results
 
 
+WRITING_SECTIONS = {"practical_writing", "continuation_writing"}
+
+
+@functools.lru_cache(maxsize=8)
+def cached_docx(path: str) -> DocxDoc:
+    """One parse per paper, not one per question.
+
+    A run selects ~6 questions from each paper and every one of them wants a slice
+    of the same answer section, so the uncached version unzipped and parsed the
+    whole file 18 times to read 18 spans out of 3 documents.
+    """
+    return read_docx(Path(path))
+
+
+def blocks_text(doc: DocxDoc, span: list[int]) -> str:
+    """The text of a half-open ``[lo, hi)`` range of body children."""
+    if len(span) != 2:
+        return ""
+    lo, hi = span
+    return "\n".join(
+        block.text.strip()
+        for block in doc.blocks
+        if lo <= block.body_index < hi and block.text.strip()
+    )
+
+
+def official_explanation_text(segment: dict) -> str:
+    """What the paper itself already says about this item's answer.
+
+    For the numbered sections that is its 【N题详解】 blocks; only the indices are
+    stored on the segment (see ``make_local_segment``), so the text is recovered
+    from the source file here.
+
+    For the two writing sections the paper writes no 详解 at all — its answer *is*
+    the 参考范文, which the segmenter stored as the answer key. Returning "" for
+    those left the writing prompt telling the model to "写得比它更好" than a model
+    essay it had never been shown, while the teacher edition printed that same
+    essay right above our answer.
+
+    Still "" when the paper genuinely explained nothing: 广东's answer section
+    skips four whole sections, and there the model writes the explanation alone.
+    """
+    span = segment.get("official_explanation_blocks") or []
+    source = segment.get("source_path") or ""
+    if len(span) == 2 and source and Path(source).exists():
+        text = blocks_text(cached_docx(source), span)
+        if text:
+            return text
+
+    if segment.get("section") in WRITING_SECTIONS:
+        essay = segment.get("answer_key")
+        if isinstance(essay, str) and essay.strip() and essay.strip() != NO_ANSWER_MARKER:
+            return essay.strip()
+    return ""
+
+
+# Two different ways the model breaks its own JSON, and telling it the wrong one makes
+# things worse. Saying "don't use double quotes" — which is right for the *contents* of a
+# string — got flash to render the JSON's own syntax in Chinese curly quotes
+# (`{“word”: “x”}`), and then the repair turn said it again and it did it again.
+JSON_REPAIR_SMART_QUOTES = (
+    "你刚才那条输出不是合法 JSON：**JSON 的语法符号被写成了中文引号**。"
+    "花括号、方括号、冒号，以及包裹键名和值的那对引号，必须是标准英文半角字符：\n"
+    '正确：{"word": "abandon", "meaning": "放弃"}\n'
+    '错误：{“word”: “abandon”, “meaning”: “放弃”}\n'
+    "只有字符串**内部**引用原文时才用中文引号“”。请重新输出一遍，只输出合法 JSON，"
+    "不要用代码块包裹，不要加任何解释。"
+)
+
+JSON_REPAIR_TURN = (
+    "你刚才那条输出不是合法 JSON（多半是在字符串内部用了没转义的英文双引号）。"
+    "请把同样的内容重新输出一遍：JSON 的语法符号仍用标准英文半角引号，"
+    "但字符串内部引用原文时改用中文引号“”。"
+    "不要用代码块包裹，不要加任何解释。"
+)
+
+
+def _repair_instruction(content: str) -> str:
+    """Name the actual mistake. A generic scolding just produces the same reply again."""
+    head = content.lstrip()[:400]
+    if "“" in head or "”" in head:
+        return JSON_REPAIR_SMART_QUOTES
+    return JSON_REPAIR_TURN
+
+
+def ask_for_json(
+    conversation: "Conversation | None",
+    args: argparse.Namespace,
+    prompt: str,
+    *,
+    model: str,
+    reasoning_effort: str,
+    thinking: str,
+    max_tokens: int,
+    stage: str = "",
+    item_id: str = "",
+) -> tuple[dict | str, ChatResult, list[dict]]:
+    """Ask, and give one corrective turn if the reply is not valid JSON.
+
+    A model writing an English model essay reaches for a quotation mark sooner or
+    later — `like "accept your feelings" helped me` — and one unescaped `"` makes
+    the whole reply unparseable. Repairing the string here would be exactly the
+    silent degradation this pipeline refuses to do, and failing the run over a
+    punctuation slip wastes the whole paper. So it is handed back to the model,
+    which is cheap: inside a conversation the retry re-reads a cached prefix.
+
+    A reply that is still broken after that is a hard error, as before.
+    """
+    usages: list[dict] = []
+
+    def ask(text: str) -> ChatResult:
+        if conversation is not None:
+            return conversation.ask(text, max_tokens=max_tokens, item_id=item_id)
+        return call_stage_model(
+            args, text, model=model, reasoning_effort=reasoning_effort,
+            thinking=thinking, max_tokens=max_tokens, stage=stage, item_id=item_id,
+        )
+
+    result = ask(prompt)
+    usages.append(result.usage if isinstance(result.usage, dict) else {})
+    parsed = parse_model_json(result.content)
+    if isinstance(parsed, dict):
+        return parsed, result, usages
+
+    # Truncation is a different failure: retrying it just truncates again, and
+    # require_parsed says so with the token counts. Only offer the repair turn
+    # when there was room to answer.
+    produced = int((result.usage or {}).get("completion_tokens") or 0)
+    if max_tokens and produced >= max_tokens:
+        return parsed, result, usages
+
+    retry = ask(_repair_instruction(result.content))
+    usages.append(retry.usage if isinstance(retry.usage, dict) else {})
+    return parse_model_json(retry.content), retry, usages
+
+
+def explain_one_selected(
+    row: dict,
+    args: argparse.Namespace,
+    out_dir: Path,
+    conversation: "Conversation | None" = None,
+) -> dict:
+    raise_if_cancelled()
+    explain_dir = out_dir / "explanations"
+    ensure_dir(explain_dir)
+    item_id = row["item_id"]
+    explain_path = explain_dir / f"{safe_filename(item_id)}.json"
+    if explain_path.exists() and not args.force:
+        existing = read_json(explain_path)
+        if isinstance(existing, dict):
+            row["explanation"] = existing.get("explanation", existing)
+            row["explanation_path"] = str(explain_path)
+            row["has_official_explanation"] = bool(existing.get("has_official_explanation"))
+            return row
+
+    segment = read_json(Path(row["segment_path"]))
+    if not isinstance(segment, dict):
+        raise RuntimeError(f"Invalid segment file for {item_id}")
+    section = str(row.get("section") or segment.get("section") or "")
+    official = official_explanation_text(segment)
+    numbers = question_numbers(section, segment.get("answer_key"))
+
+    # Cloze (15 questions) and grammar (10) are asked five at a time, inside the
+    # same conversation: the passage and the instructions are then a cached prefix
+    # on every turn after the first, and no single reply is long enough to be cut
+    # off by max_tokens.
+    merged: dict = {}
+    usages: list[dict] = []
+    clients: list[str] = []
+    for chunk in explain_chunks(section, numbers):
+        raise_if_cancelled()
+        prompt = build_explain_prompt(segment, section, chunk, official)
+        parsed, chat_result, turn_usages = ask_for_json(
+            conversation,
+            args,
+            prompt,
+            model=args.explain_model,
+            reasoning_effort=args.explain_reasoning_effort,
+            thinking=args.explain_thinking,
+            max_tokens=args.explain_max_tokens,
+            stage="explain",
+            item_id=item_id,
+        )
+        label = item_id if len(numbers) == len(chunk) else f"{item_id}__q{chunk[0]}"
+        save_api_conversation(out_dir, "explain", label, prompt, chat_result, args)
+        piece = require_parsed(parsed, chat_result, args.explain_max_tokens, "explain", label)
+        usages.extend(turn_usages)
+        clients.append(chat_result.client_used)
+
+        # Question-by-question sections come back as {"questions": [...]}; the two
+        # writing sections have their own shape and are never chunked.
+        if "questions" in piece:
+            merged.setdefault("questions", []).extend(piece.get("questions") or [])
+        else:
+            merged.update(piece)
+
+    if numbers:
+        got = {str(q.get("number")) for q in merged.get("questions", []) if isinstance(q, dict)}
+        missing = [n for n in numbers if str(n) not in got]
+        if missing:
+            # Silently shipping a page with holes in it is how a teacher discovers
+            # mid-lesson that question 47 has no explanation.
+            raise RuntimeError(f"explain 漏讲了题目 {missing}：{item_id}。请重试或调高 --explain-max-tokens。")
+
+    merged.setdefault("item_id", item_id)
+    result = {
+        "item_id": item_id,
+        "source_doc": row.get("source_doc", ""),
+        "section": section,
+        "display_section": row.get("display_section", ""),
+        "item_label": row.get("item_label", ""),
+        "has_official_explanation": bool(official),
+        "explanation": merged,
+        "usage": merge_usages(usages),
+        "model": stage_model_name(args, "explain"),
+        "client_used": clients[0] if clients else "",
+        "prompt_version": EXPLAIN_PROMPT_VERSION,
+    }
+    write_json(explain_path, result)
+    row["explanation"] = merged
+    row["explanation_path"] = str(explain_path)
+    row["has_official_explanation"] = bool(official)
+    return row
+
+
+def merge_usages(usages: list[dict]) -> dict:
+    """Add up the turns an item took, so the cost report still sees one call's worth."""
+    total: dict = {}
+    for usage in usages:
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens",
+                    "prompt_cache_hit_tokens", "prompt_cache_miss_tokens"):
+            total[key] = total.get(key, 0) + int(usage.get(key) or 0)
+    return total
+
+
+def run_explain(args: argparse.Namespace) -> list[dict]:
+    out_dir = Path(args.out)
+    api_key = args.api_key or os.environ.get(args.api_key_env)
+    if not api_key:
+        raise SystemExit(f"Missing API key. Set {args.api_key_env} or pass --api-key.")
+    selection_path = out_dir / "selected_items.json"
+    if not selection_path.exists():
+        raise SystemExit(f"Missing {selection_path}. Run --mode select first.")
+    selected = read_json(selection_path)
+    if not isinstance(selected, list):
+        raise SystemExit(f"Invalid {selection_path}")
+
+    # One conversation per paper, exactly as enrich does it: the turns of a paper
+    # run in sequence so each re-reads a cached prefix, and papers run in parallel
+    # so the wall clock is one paper's worth of turns, not the whole run's.
+    by_paper: dict[str, list[dict]] = {}
+    for row in selected:
+        by_paper.setdefault(str(row.get("source_doc", "")), []).append(row)
+
+    log(
+        args,
+        f"Explaining {len(selected)} selected item(s) with {args.explain_model}; "
+        f"{len(by_paper)} conversation(s), one per paper.",
+    )
+    results: list[dict] = []
+    conversations: list[Conversation] = []
+    done = 0
+    lock = threading.Lock()
+
+    def explain_paper(rows: list[dict]) -> list[dict]:
+        nonlocal done
+        conversation = Conversation(
+            args,
+            model=args.explain_model,
+            reasoning_effort=args.explain_reasoning_effort,
+            thinking=args.explain_thinking,
+            stage="explain",
+        )
+        with lock:
+            conversations.append(conversation)
+        out: list[dict] = []
+        for row in rows:
+            out.append(explain_one_selected(row, args, out_dir, conversation=conversation))
+            with lock:
+                done += 1
+                log(args, f"  explained {row['item_id']} ({done}/{len(selected)})")
+        return out
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(args.explain_workers, len(by_paper)))) as executor:
+        future_map = {executor.submit(explain_paper, rows): doc for doc, rows in by_paper.items()}
+        for future in concurrent.futures.as_completed(future_map):
+            doc = future_map[future]
+            try:
+                results.extend(future.result())
+            except Cancelled:
+                raise
+            except Exception as exc:
+                log(args, f"  explain failed for {doc}: {exc}")
+                raise
+
+    cached, total = cache_hit_ratio([u for c in conversations for u in c.usages])
+    if total:
+        log(args, f"  prompt cache: {cached}/{total} tokens hit ({100 * cached / total:.0f}%)")
+
+    missing = [r["item_id"] for r in results if not r.get("has_official_explanation")]
+    if missing:
+        log(args, f"  {len(missing)} 道题原卷未提供官方解析，教师版将只有 AI 生成的详细解析：{', '.join(missing)}")
+
+    results.sort(key=lambda r: (section_order(r.get("section", "")), r.get("source_doc", ""), r.get("item_id", "")))
+    explained_path = out_dir / "selected_items.explained.json"
+    write_json(explained_path, results)
+    write_json(selection_path, results)
+    log(args, f"Explanation outputs written: {explained_path} ({file_size_label(explained_path)})")
+    return results
+
+
+def render_explanation(explanation: object) -> str:
+    """The AI explanation as the plain text that goes under a question in Word.
+
+    Word has no Markdown renderer, so anything Markdown-ish here reaches the
+    teacher as literal asterisks. Writing items have their own shape (审题 / 思路 /
+    评分要点); everything else is a list of questions.
+    """
+    if not isinstance(explanation, dict):
+        return ""
+    if "questions" in explanation:
+        return _render_question_explanations(explanation.get("questions"))
+    return _render_writing_explanation(explanation)
+
+
+def _render_question_explanations(questions: object) -> str:
+    if not isinstance(questions, list):
+        return ""
+    lines: list[str] = []
+    for entry in questions:
+        if not isinstance(entry, dict):
+            continue
+        number = str(entry.get("number", "")).strip()
+        answer = str(entry.get("answer", "")).strip()
+        # Each section names its "what kind of question is this" field differently:
+        # 阅读 calls it question_type, 七选五 function (空格功能), 完形/语法 point (考点).
+        kind = str(entry.get("question_type") or entry.get("function") or entry.get("point") or "").strip()
+        head = f"{number}. {answer}".strip(". ")
+        if kind:
+            head = f"{head}　{kind}"
+        lines.append(head)
+
+        for label, key in (
+            ("定位", "locate"),
+            ("线索", "clues"),
+            ("这个空缺什么", "need"),
+            ("依据", "reasoning"),
+        ):
+            value = str(entry.get(key, "") or "").strip()
+            if value:
+                lines.append(f"　{label}：{value}")
+
+        for wrong in entry.get("distractors") or []:
+            if isinstance(wrong, dict):
+                option = str(wrong.get("option", "")).strip()
+                why = str(wrong.get("why_wrong", "")).strip()
+                if why:
+                    lines.append(f"　为什么不选 {option}：{why}" if option else f"　易错点：{why}")
+
+        note = str(entry.get("language_note", "") or "").strip()
+        if note:
+            lines.append(f"　语言点：{note}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+# A letter's greeting and sign-off do not count towards the word limit, so neither
+# can our count of them — the teacher checks it against the 100–120 the prompt asked
+# for, and a number that silently includes "Dear Mr. Smith / Yours, Li Hua" is four
+# words of nonsense at exactly the moment she is deciding whether the essay is too long.
+_SALUTATION = re.compile(r"^\s*(?:Dear\b|To whom)", re.I)
+_SIGN_OFF = re.compile(
+    r"^\s*(?:Yours|Sincerely|Best wishes|Best regards|Regards|Li Hua|Faithfully)\b[,.\s]*$",
+    re.I,
+)
+
+
+def essay_word_count(essay: str) -> int:
+    """Words in the body of a model essay, greeting and sign-off excluded."""
+    body = [
+        line for line in essay.split("\n")
+        if line.strip() and not _SALUTATION.match(line) and not _SIGN_OFF.match(line)
+    ]
+    return len(re.findall(r"[A-Za-z][A-Za-z'’\-]*", "\n".join(body)))
+
+
+def _render_writing_explanation(explanation: dict) -> str:
+    lines: list[str] = []
+    brief = explanation.get("审题")
+    if isinstance(brief, dict):
+        lines.append("审题")
+        for key, value in brief.items():
+            if isinstance(value, list):
+                value = "；".join(str(v) for v in value)
+            if str(value).strip():
+                lines.append(f"　{key}：{value}")
+        lines.append("")
+
+    for n, idea in enumerate(explanation.get("思路") or [], start=1):
+        if not isinstance(idea, dict):
+            continue
+        lines.append(f"思路 {n}：{str(idea.get('角度', '')).strip()}")
+        outline = idea.get("提纲")
+        if isinstance(outline, list) and outline:
+            for step in outline:
+                lines.append(f"　· {step}")
+        essay = str(idea.get("范文", "") or "").strip()
+        if essay:
+            # Counted, not trusted: the model leaves 词数 out often enough, and the
+            # word count is the first thing a teacher checks against the 100–120 /
+            # 150–180 the prompt asked for.
+            lines.append(f"　范文（{essay_word_count(essay)} 词）：")
+            lines.extend(f"　{line}" for line in essay.split("\n"))
+        highlights = idea.get("亮点")
+        if isinstance(highlights, dict):
+            for key, value in highlights.items():
+                if isinstance(value, list):
+                    value = "；".join(str(v) for v in value)
+                if str(value).strip():
+                    lines.append(f"　{key}：{value}")
+        lines.append("")
+
+    scoring = str(explanation.get("评分要点", "") or "").strip()
+    if scoring:
+        lines.append("评分要点")
+        lines.append(f"　{scoring}")
+    return "\n".join(lines).strip()
+
+
 def md_escape_heading(text: str) -> str:
     return str(text or "").replace("\n", " ").strip()
 
 
-def render_words(words: object) -> str:
-    if not isinstance(words, list) or not words:
-        return "暂无"
-    parts: list[str] = []
-    for item in words[:12]:
-        if isinstance(item, dict):
-            word = item.get("word", "")
-            meaning = item.get("meaning", "")
-            reason = item.get("teaching_reason", "")
-            parts.append(f"- `{word}`：{meaning}。{reason}".strip())
-    return "\n".join(parts) or "暂无"
+def assert_selection_is_complete(out_dir: Path) -> None:
+    """Refuse to export a selection whose questions have not all been worked through.
 
+    Re-selecting is the case this exists for. ``run_select`` and ``run_review_select``
+    both overwrite ``selected_items.json`` with plain score rows, so after the teacher
+    swaps a question in:
 
-def render_grammar(points: object) -> str:
-    if not isinstance(points, list) or not points:
-        return "暂无"
-    parts: list[str] = []
-    for item in points[:10]:
-        if isinstance(item, dict):
-            typ = item.get("type", "考点")
-            evidence = item.get("evidence", "")
-            teaching = item.get("teaching_point", "")
-            parts.append(f"- {typ}：{evidence}。{teaching}".strip())
-    return "\n".join(parts) or "暂无"
+    * the new question has no ``explanations/<item_id>.json``, and the teacher edition
+      used to export it anyway — one paper in the middle of the handout with an empty
+      「详细解析和解答步骤」 section and no warning anywhere;
+    * the word list must cover what is being exported — and what that means depends on how
+      the list was built, so the check is dispatched on the list's own ``vocab_mode``
+      rather than on whatever the command line happens to say today.
 
+    Both are the kind of wrong-but-plausible file that gets handed out before anyone
+    notices, so this stops the export instead.
+    """
+    selection = out_dir / "selected_items.json"
+    rows = read_json(selection)
+    if not isinstance(rows, list) or not rows:
+        raise SystemExit(f"Missing or empty {selection}. Run --mode select first.")
+    wanted = [str(row.get("item_id", "")) for row in rows if isinstance(row, dict)]
 
-def render_sentences(points: object) -> str:
-    if not isinstance(points, list) or not points:
-        return "暂无"
-    parts: list[str] = []
-    for index, item in enumerate(points[:5], start=1):
-        if isinstance(item, dict):
-            sentence = item.get("sentence", "")
-            analysis = item.get("structure_analysis", "")
-            teaching = item.get("teaching_point", "")
-            parts.append(
-                f"{index}. **原句：** {sentence}\n"
-                f"   - **结构：** {analysis}\n"
-                f"   - **讲解：** {teaching}"
+    missing = [item_id for item_id in wanted if not (out_dir / "explanations" / f"{safe_filename(item_id)}.json").exists()]
+    if missing:
+        raise SystemExit(
+            f"{len(missing)} 道选中的题还没有逐题解析，教师讲解版会缺页：{', '.join(missing[:3])}"
+            f"{' …' if len(missing) > 3 else ''}\n请先跑 --mode explain（已生成的题会走缓存，不会重复花钱）。"
+        )
+
+    index_path = out_dir / "vocab_index.json"
+    if not index_path.exists():
+        return  # the handout is optional; export_vocab already skips it with a note
+    index = read_json(index_path)
+    if not isinstance(index, list) or not index:
+        return
+
+    # Ask the word list which rules it was built under — not the command line.
+    #
+    # The teacher can flip 完整/困难 in 基础模式 and export without re-running vocab. If
+    # this gate read args.vocab_mode it would check 分块's rules against an 整卷 list and
+    # refuse a handout that is perfectly good. What has to be checked is whether *this
+    # list*, on its own terms, covers what is being exported.
+    #
+    modes = {vocab_row_mode(row) for row in index if isinstance(row, dict)}
+    if len(modes) > 1:
+        raise SystemExit(
+            "重难点词汇表里混着两种模式的结果（完整/困难各一半），说明上一次跑到一半换了档。\n"
+            "请跑 --mode vocab --force 重出一份。"
+        )
+    mode = modes.pop()
+
+    if mode == VOCAB_CHUNKED:
+        # 完整（分块）: the words are per-question, so a question that was swapped in after
+        # the list was built has no words on the sheet at all.
+        covered = {str(row.get("item_id", "")) for row in index if isinstance(row, dict)}
+        stale = [item_id for item_id in wanted if item_id not in covered]
+        if stale:
+            raise SystemExit(
+                f"重难点词汇表还是上一批选题的（{len(stale)} 道新题不在里面）。\n"
+                "请先跑 --mode vocab，否则学生拿到的是旧词表。"
             )
-    return "\n".join(parts) or "暂无"
+        return
+
+    # 困难（整卷）: the words belong to the paper, so re-picking questions inside a paper we
+    # have already read cannot stale anything. What still has to hold is that every paper
+    # contributing a question was actually read.
+    covered = {str(row.get("source_doc", "")) for row in index if isinstance(row, dict)}
+    needed = {str(row.get("source_doc", "")) for row in rows if isinstance(row, dict) and row.get("source_doc")}
+    stale = sorted(needed - covered)
+    if stale:
+        raise SystemExit(
+            f"重难点词汇表少了 {len(stale)} 份卷子：{', '.join(stale[:3])}"
+            f"{' …' if len(stale) > 3 else ''}\n请先跑 --mode vocab，否则学生拿到的词表不完整。"
+        )
 
 
-def merge_cached_enrichments(selected: list[dict], enriched_cache: object) -> int:
-    if not isinstance(enriched_cache, list):
+def merge_cached_explanations(selected: list[dict], explained_cache: object) -> int:
+    """Restore explanations onto rows that lost them.
+
+    ``selected_items.json`` is rewritten by several stages, so a row can come back
+    without the explanation the export needs. The cache refills those, but a row
+    that already carries an explanation keeps it — the cache is a fallback, not the
+    authority, or a re-run with ``--force`` would be undone by its own leftovers.
+    """
+    if not isinstance(explained_cache, list):
         return 0
-    enrichment_by_id = {
-        str(item.get("item_id") or ""): item.get("enrichment")
-        for item in enriched_cache
-        if isinstance(item, dict) and isinstance(item.get("enrichment"), dict)
+    by_id = {
+        str(item.get("item_id") or ""): item
+        for item in explained_cache
+        if isinstance(item, dict) and isinstance(item.get("explanation"), dict)
     }
     merged = 0
     for item in selected:
-        if not isinstance(item, dict) or isinstance(item.get("enrichment"), dict):
+        if not isinstance(item, dict) or isinstance(item.get("explanation"), dict):
             continue
-        cached = enrichment_by_id.get(str(item.get("item_id") or ""))
-        if isinstance(cached, dict):
-            item["enrichment"] = cached
+        cached = by_id.get(str(item.get("item_id") or ""))
+        if cached:
+            item["explanation"] = cached["explanation"]
+            item["has_official_explanation"] = bool(cached.get("has_official_explanation"))
             merged += 1
     return merged
 
@@ -2529,12 +4616,11 @@ def run_assemble(args: argparse.Namespace) -> None:
     selected = read_json(selection_path)
     if not isinstance(selected, list):
         raise SystemExit(f"Invalid {selection_path}")
-    enriched_cache_path = out_dir / "selected_items.enriched.json"
-    if enriched_cache_path.exists():
-        enriched_cache = read_json(enriched_cache_path)
-        merged = merge_cached_enrichments(selected, enriched_cache)
+    explained_cache_path = out_dir / "selected_items.explained.json"
+    if explained_cache_path.exists():
+        merged = merge_cached_explanations(selected, read_json(explained_cache_path))
         if merged:
-            log(args, f"Merged cached enrichment into {merged} selected item(s) before assembly.")
+            log(args, f"Merged cached explanations into {merged} selected item(s) before assembly.")
     assembled_dir = out_dir / "assembled"
     ensure_dir(assembled_dir)
 
@@ -2551,9 +4637,9 @@ def run_assemble(args: argparse.Namespace) -> None:
         "> 按题型和题目顺序汇总，供教师快速核对。",
     ]
     teacher_lines = [
-        "# 教师讲解与评分说明",
+        "# 教师讲解",
         "",
-        "> 包含选题依据、重点词汇、语法考点、长难句分析和课堂建议。",
+        "> 每题：原卷的官方答案与解析，再加一份 AI 逐题详细解析。",
     ]
 
     current_section = ""
@@ -2603,26 +4689,15 @@ def run_assemble(args: argparse.Namespace) -> None:
                 "",
                 f"- 来源：{row.get('source_doc', '')}",
                 f"- 主题：{score.get('topic', '')}",
-                f"- 评分：新颖度 {score.get('novelty_score', '')}；难度 {score.get('difficulty_score', '')}；词汇价值 {score.get('vocabulary_value_score', '')}；语法价值 {score.get('grammar_value_score', '')}；推荐度 {score.get('recommendation_score', '')}",
                 f"- 入选理由：{score.get('selection_reason', '')}",
-                f"- 课堂建议：{score.get('classroom_suggestion', '')}",
                 "",
-                "#### 重点词汇",
-                render_words(score.get("core_high_frequency_words", []))
-                + "\n"
-                + render_words(score.get("familiar_words_new_meanings", []))
-                + "\n"
-                + render_words(score.get("difficult_or_low_frequency_words", [])),
+                "#### 官方答案与解析",
                 "",
-                "#### 语法与词汇变形",
-                render_grammar(score.get("word_formation_and_grammar", [])),
+                official_explanation_text(segment) or f"{answer_key_text(segment.get('answer_key'))}\n（原卷未提供逐题解析）",
                 "",
-                "#### 长难句",
-                render_sentences(score.get("long_difficult_sentences", [])),
+                "#### 详细解析和解答步骤",
                 "",
-                "#### 补充讲解建议",
-                "",
-                str(score.get("teaching_notes", "") or "暂无"),
+                render_explanation(row.get("explanation")) or "暂无",
             ]
         )
 
@@ -2765,19 +4840,23 @@ def run_preflight(args: argparse.Namespace) -> None:
     local_segment_count = 0
     local_segment_chars = 0
     low_confidence_docs: list[str] = []
+    total_tokens = 0
+    local_segment_tokens = 0
     for docx in docx_files:
         text = extract_docx_text(docx)
         total_chars += len(text)
+        total_tokens += count_tokens(text)
         if args.segment_input == "local":
             segments = local_segment_paper(docx.name, text)
             local_segment_count += len(segments)
             local_segment_chars += sum(len(segment_body(segment)) for segment in segments)
+            local_segment_tokens += sum(count_tokens(segment_body(segment)) for segment in segments)
             if len(segments) < 7:
                 low_confidence_docs.append(f"{docx.name}（本地只识别到 {len(segments)} 个单元）")
 
     api_segment_calls = 0 if args.segment_input == "local" else len(docx_files)
     score_calls = local_segment_count if args.segment_input == "local" else "取决于 segment 输出"
-    approx_score_prompt_tokens = rough_token_estimate("x" * local_segment_chars) if args.segment_input == "local" else "取决于 segment 输出"
+    approx_score_prompt_tokens = local_segment_tokens if args.segment_input == "local" else "取决于 segment 输出"
     existing_conversations = len(list((out_dir / "api_conversations").rglob("*.md"))) if (out_dir / "api_conversations").exists() else 0
     current_docs = {docx.name for docx in docx_files}
     stale_extracted = []
@@ -2789,7 +4868,8 @@ def run_preflight(args: argparse.Namespace) -> None:
 
     log(args, "Preflight summary:")
     log(args, f"  input docx: {len(docx_files)}")
-    log(args, f"  extracted text chars: {total_chars:,} (roughly {rough_token_estimate('x' * total_chars):,} tokens if sent once)")
+    counter = "DeepSeek 分词器" if deepseek_tokens.is_exact() else "字符估算（分词器未加载）"
+    log(args, f"  extracted text chars: {total_chars:,} → {total_tokens:,} tokens（{counter}）")
     log(args, f"  segment mode: {args.segment_input}; expected segment API calls: {api_segment_calls}")
     if args.segment_input == "local":
         log(args, f"  local segments: {local_segment_count}; score API calls after segment: {score_calls}")
@@ -3014,7 +5094,11 @@ def run_stage1(args: argparse.Namespace) -> None:
     run_select(args)
     if args.review_select:
         run_review_select(args)
-    run_enrich_selected(args)
+    # The teacher edition is 原题 + 官方解析 + 详细解析和解答步骤, so what it needs from the
+    # model is per-question explanation, not the vocabulary/long-sentence notes that
+    # `enrich` produces — nothing renders those any more. `enrich-selected` is still
+    # a mode you can run by hand; it is just no longer part of the chain.
+    run_explain(args)
     run_assemble(args)
 
 
@@ -3262,22 +5346,48 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--out", default="outputs/gaokao_english", help="Output folder.")
     parser.add_argument(
         "--mode",
-        choices=["prompts", "analyze", "final", "preflight", "segment", "score", "select", "review-select", "enrich-selected", "assemble", "repair-answers", "quality-report", "export-docx", "stage1"],
+        choices=["prompts", "analyze", "final", "preflight", "segment", "score", "select", "review-select", "enrich-selected", "explain", "vocab", "assemble", "repair-answers", "quality-report", "export-docx", "stage1"],
         default="prompts",
     )
     parser.add_argument("--prompt-template", default="config/analysis_prompt_template.md")
-    parser.add_argument("--provider", default="deepseek", help="Label only, for your own notes.")
-    # DEEPSEEK TUNING: official OpenAI-SDK style uses the API root here.
-    parser.add_argument("--base-url", default="https://api.deepseek.com")
-    # DEEPSEEK TUNING: deepseek-chat / deepseek-reasoner are legacy aliases.
-    parser.add_argument("--model", default="deepseek-v4-pro")
-    parser.add_argument("--segment-model", default="deepseek-v4-flash", help="Model used to split full papers into section JSON files.")
-    parser.add_argument("--score-model", default="deepseek-v4-flash", help="Model used to score each segmented item.")
-    parser.add_argument("--review-model", default="deepseek-v4-pro", help="Model used to review local shortlist selections.")
-    parser.add_argument("--enrich-model", default="deepseek-v4-flash", help="Model used to enrich final selected items with words/grammar/sentences.")
+    parser.add_argument(
+        "--provider",
+        choices=list(pv.PROVIDER_ORDER),
+        default=pv.DEFAULT_PROVIDER,
+        help="Which API to talk to. Decides the protocol, the thinking field and which "
+             "strength levels exist — see scripts/providers.py.",
+    )
+    # These three default to None and are filled in from the provider after parsing, so
+    # that picking a provider is enough and nobody has to also remember its URL, its key
+    # variable and its model names.
+    parser.add_argument("--base-url", default=None, help="API root (not the /chat/completions path).")
+    parser.add_argument("--api-key-env", default=None, help="Env var holding the key. Defaults to the provider's.")
+    parser.add_argument("--model", default=None, help="Model for the legacy analyze/final modes.")
+    # The per-stage model/effort/thinking flags below default to None so that
+    # --preset can fill them without overriding anything the caller asked for
+    # explicitly. apply_preset() resolves them right after parsing.
+    parser.add_argument(
+        "--preset",
+        choices=[mp.SPEED, mp.QUALITY],
+        default=mp.SPEED,
+        help="speed = flash everywhere (cheap, for test runs); quality = pro (for the batch you hand out). "
+             "Individual --score-model/--explain-model/... still win over the preset.",
+    )
+    parser.add_argument("--segment-model", default=None, help="Model used to split full papers into section JSON files.")
+    parser.add_argument("--score-model", default=None, help="Model used to score each segmented item.")
+    parser.add_argument("--review-model", default=None, help="Model used to review local shortlist selections.")
+    parser.add_argument("--enrich-model", default=None, help="Model used for the legacy enrich mode.")
+    parser.add_argument("--explain-model", default=None, help="Model used to write the per-question explanations in the teacher edition.")
+    # vocab used to ride on --enrich-model with its effort hardcoded, so the词汇表
+    # silently ignored whichever preset the teacher had picked. It is its own stage now.
+    parser.add_argument("--vocab-model", default=None, help="Model used for the student vocabulary handout.")
     parser.add_argument("--segment-workers", type=int, default=16, help="Concurrent docx segmentation requests.")
     parser.add_argument("--score-workers", type=int, default=16, help="Concurrent scoring requests.")
-    parser.add_argument("--enrich-workers", type=int, default=16, help="Concurrent enrichment requests for selected items.")
+    parser.add_argument("--enrich-workers", type=int, default=16, help="Concurrent vocabulary/enrichment conversations (one per paper).")
+    # Defaults to --enrich-workers so the GUI, which passes only that one, still
+    # drives this. Both are capped by the number of papers anyway: a conversation
+    # has to stay on one paper for its prefix to keep hitting the cache.
+    parser.add_argument("--explain-workers", type=int, default=None, help="Concurrent explanation conversations (one per paper).")
     parser.add_argument("--segment-input", choices=["local", "rough", "full"], default="local", help="local parses common exam structure without API; rough/full use model segmentation.")
     parser.add_argument(
         "--segment-warning-fallback",
@@ -3287,34 +5397,82 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--answer-tail-chars", type=int, default=8000, help="Characters of the final answer area appended to rough segment chunks.")
     parser.add_argument("--review-candidates", type=int, default=6, help="Local shortlist size per section before pro review.")
-    parser.add_argument("--segment-reasoning-effort", choices=["none", "low", "medium", "high"], default="none")
-    parser.add_argument("--score-reasoning-effort", choices=["none", "low", "medium", "high"], default="none")
-    parser.add_argument("--review-reasoning-effort", choices=["none", "low", "medium", "high"], default="medium")
-    parser.add_argument("--enrich-reasoning-effort", choices=["none", "low", "medium", "high"], default="none")
+    # No `choices=` on any effort flag: argparse fixes its choices at parse time, but
+    # which levels exist is a property of the provider you have not chosen yet (DeepSeek
+    # has 2, OpenAI 6, GLM none). apply_preset() normalises them once the provider is
+    # known, and an unknown level folds onto a real one instead of aborting the run.
+    parser.add_argument("--segment-reasoning-effort", default="high")
+    parser.add_argument("--score-reasoning-effort", default=None)
+    parser.add_argument("--review-reasoning-effort", default=None)
+    parser.add_argument("--enrich-reasoning-effort", default=None)
+    parser.add_argument("--explain-reasoning-effort", default=None)
     parser.add_argument("--segment-thinking", choices=["enabled", "disabled", "omit"], default="disabled")
-    parser.add_argument("--score-thinking", choices=["enabled", "disabled", "omit"], default="disabled")
-    parser.add_argument("--review-thinking", choices=["enabled", "disabled", "omit"], default="enabled")
-    parser.add_argument("--enrich-thinking", choices=["enabled", "disabled", "omit"], default="disabled")
-    parser.add_argument("--api-key-env", default="DEEPSEEK_API_KEY")
-    # PDF input. The layout-parsing service is deployed per AI Studio account, so
-    # the base URL has to come from the user's own console — there is no global one.
+    parser.add_argument("--score-thinking", choices=["enabled", "disabled", "omit"], default=None)
+    parser.add_argument("--review-thinking", choices=["enabled", "disabled", "omit"], default=None)
+    parser.add_argument("--enrich-thinking", choices=["enabled", "disabled", "omit"], default=None)
+    parser.add_argument("--explain-thinking", choices=["enabled", "disabled", "omit"], default=None)
+    # PDF input.
+    parser.add_argument("--pdf-backend", choices=["paddle", "mineru"], default="paddle", help="Which OCR service turns a PDF into a .docx.")
+    # PaddleOCR's layout-parsing service is deployed per AI Studio account, so the base
+    # URL has to come from the user's own console — there is no global one.
     parser.add_argument("--paddle-base-url", default="", help="PaddleOCR layout-parsing URL (or set PADDLEOCR_BASE_URL).")
     parser.add_argument("--paddle-token", default="", help="AI Studio access token (or set PADDLEOCR_ACCESS_TOKEN).")
+    parser.add_argument("--mineru-token", default="", help="MinerU API token (or set MINERU_TOKEN).")
     parser.add_argument("--api-key", default="")
     # DEEPSEEK TUNING: `auto` tries the OpenAI SDK first, then falls back to raw HTTP.
     parser.add_argument("--client", choices=["auto", "sdk", "http"], default="auto")
-    # DEEPSEEK TUNING: set to none if a non-DeepSeek-compatible endpoint rejects it.
-    parser.add_argument("--reasoning-effort", choices=["none", "low", "medium", "high"], default="high")
-    # DEEPSEEK TUNING: official DeepSeek thinking mode uses enabled. Use omit for old endpoints.
+    parser.add_argument(
+        "--insecure-ssl",
+        action="store_true",
+        help="Skip HTTPS certificate verification. Only for a network that intercepts TLS and whose "
+             "root certificate is not in the macOS Keychain — see scripts/net_tls.py.",
+    )
+    parser.add_argument("--reasoning-effort", default="high")
     parser.add_argument("--thinking", choices=["enabled", "disabled", "omit"], default="enabled")
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--timeout", type=int, default=120)
     parser.add_argument("--max-retries", type=int, default=8, help="Max retries for retryable API errors such as 429 rate limits.")
     parser.add_argument("--max-tokens", type=int, default=6000, help="Output token cap for legacy analyze/final modes.")
     parser.add_argument("--segment-max-tokens", type=int, default=16000, help="Output token cap for AI segmentation. Ignored by local segmentation.")
-    parser.add_argument("--score-max-tokens", type=int, default=1200, help="Output token cap for each lightweight score call.")
-    parser.add_argument("--review-max-tokens", type=int, default=2500, help="Output token cap for each review-select call.")
-    parser.add_argument("--enrich-max-tokens", type=int, default=3500, help="Output token cap for each selected-item enrichment call.")
+    # DEEPSEEK TUNING: reasoning tokens are billed and *counted* as output, so
+    # max_tokens has to cover the thinking as well as the answer. With thinking on,
+    # a 1200-token cap left one scoring call literally 0 tokens for its JSON: the
+    # reply was truncated, the score silently became unparseable, and the item was
+    # then ranked as if it had scored zero. These caps are sized for reasoning +
+    # answer, not answer alone.
+    parser.add_argument("--score-max-tokens", type=int, default=4000, help="Output token cap for each lightweight score call (includes reasoning tokens).")
+    parser.add_argument("--review-max-tokens", type=int, default=6000, help="Output token cap for each review-select call (includes reasoning tokens).")
+    parser.add_argument("--enrich-max-tokens", type=int, default=8000, help="Output token cap for each selected-item enrichment call (includes reasoning tokens).")
+    # An explain turn covers at most 5 questions (see EXPLAIN_CHUNK_SIZE), but a
+    # writing item asks for 2-3 full model essays plus their analysis in one reply,
+    # which is the largest thing this pipeline asks any model to produce.
+    parser.add_argument("--explain-max-tokens", type=int, default=16000, help="Output token cap for each explanation turn (includes reasoning tokens).")
+    # Vocabulary reads a whole paper at once now, and runs at the preset's 深度 setting
+    # like every other stage. 决策 9 warned about exactly this, and a measured run proves
+    # it was right to: on the three sample papers, **94% of the output tokens were
+    # reasoning** (87,395 of 92,853), and the worst single call spent 38,934 tokens to
+    # emit a word list of about 1,900. At the old 16,000 cap all three calls would have
+    # been truncated.
+    #
+    # So the cap has to clear that by a real margin, not by luck. 22000 x3 lands on
+    # MAX_EFFORT_TOKEN_CEILING (64,000), which leaves ~39% headroom over the worst
+    # observed call rather than the 19% that 48,000 gave.
+    #
+    # If this ever starts reporting 「被 max_tokens 截断」 again, the answer is not another
+    # bump: pin vocab back to the standard effort. It produced a word list of the same
+    # size (114 vs 116) in a quarter of the time and a quarter of the money.
+    # Which way to build the handout. A teaching choice, not a technical one — 基础模式
+    # puts it in front of the teacher:
+    #   chunked (完整) — one call per selected question; the words match the paper she
+    #       is handing out, question for question.
+    #   whole   (困难) — read the paper end to end; the model can judge whether a word is
+    #       genuinely hard for *this* paper, at the cost of naming words from questions
+    #       the student's copy does not contain.
+    parser.add_argument("--vocab-mode", choices=list(VOCAB_MODES), default=VOCAB_WHOLE,
+                        help="chunked = 完整（逐题分块）; whole = 困难（通读整卷）。")
+    parser.add_argument("--vocab-max-tokens", type=int, default=22000, help="Output token cap for each vocabulary call (includes reasoning tokens).")
+    parser.add_argument("--vocab-reasoning-effort", default=None)
+    parser.add_argument("--vocab-thinking", choices=["enabled", "disabled", "omit"], default=None)
     parser.add_argument(
         "--show-output",
         choices=["none", "preview", "full"],
@@ -3338,6 +5496,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--save-conversations", action=argparse.BooleanOptionalAction, default=True, help="Save prompt/response markdown files for API calls.")
     parser.add_argument("--review-select", action="store_true", help="In --mode stage1, run pro review-select after local select.")
     parser.add_argument(
+        "--reselect",
+        action="store_true",
+        help="In --mode review-select, tell the model the current picks were rejected and to choose different ones.",
+    )
+    parser.add_argument(
         "--init",
         action="store_true",
         help="Clear the --out generated outputs/checkpoints before running the selected mode.",
@@ -3348,12 +5511,78 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Clear the --out generated outputs/checkpoints and exit without running prompts/analyze/final.",
     )
     parser.add_argument("--force", action="store_true", help="Re-analyze items even if cached results exist.")
-    return parser.parse_args(argv)
+    return apply_preset(parser.parse_args(argv))
+
+
+# (stage, effort flag, output-cap flag) for every stage that talks to the model.
+# segment is here for its caps even though no preset drives it: it runs locally, and its
+# model is only the fallback for a paper whose structure no rule can read.
+STAGE_EFFORT_CAPS = (
+    ("segment", "segment_reasoning_effort", "segment_max_tokens"),
+    ("score", "score_reasoning_effort", "score_max_tokens"),
+    ("review", "review_reasoning_effort", "review_max_tokens"),
+    ("enrich", "enrich_reasoning_effort", "enrich_max_tokens"),
+    ("explain", "explain_reasoning_effort", "explain_max_tokens"),
+    ("vocab", "vocab_reasoning_effort", "vocab_max_tokens"),
+)
+
+
+def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
+    """Fill in everything the caller left unset, now that we know who we are talking to.
+
+    The flags default to ``None`` rather than to a model name so that "unset" is
+    distinguishable from "set to the same value the preset would have chosen" — an
+    explicit ``--score-model deepseek-v4-pro`` has to survive ``--preset speed``. The
+    same trick now covers the provider's own URL, key variable and models, so that
+    ``--provider anthropic`` alone is a complete instruction.
+    """
+    provider = pv.get(args.provider)
+
+    if not args.base_url:
+        args.base_url = provider.base_url
+    if not args.api_key_env:
+        args.api_key_env = provider.api_key_env
+    if not args.model:
+        args.model = provider.role_model(pv.PRO)
+    if not args.segment_model:
+        args.segment_model = mp.default_segment_model(args.provider)
+
+    for key, value in mp.preset_values(args.preset, args.provider).items():
+        # --score-reasoning-effort lands in args as score_reasoning_effort.
+        attr = key.replace("_effort", "_reasoning_effort")
+        if getattr(args, attr, None) is None:
+            setattr(args, attr, value)
+    if args.explain_workers is None:
+        args.explain_workers = args.enrich_workers
+
+    # Fold away any level this provider does not really have (a `max` saved against
+    # DeepSeek arriving at GLM, which has no strength dial at all), then scale the output
+    # caps for every stage running at its model's deepest setting. Done here, once, so
+    # the *same* number reaches both the request and require_parsed() — scaling it inside
+    # the client would leave the truncation check comparing against the old cap and
+    # calling a perfectly healthy reply truncated.
+    for stage, effort_attr, cap_attr in STAGE_EFFORT_CAPS:
+        model = stage_model_name(args, stage)
+        effort = mp.normalize_effort(getattr(args, effort_attr, "") or "", args.provider, model)
+        setattr(args, effort_attr, effort)
+        setattr(
+            args,
+            cap_attr,
+            effective_max_tokens(getattr(args, cap_attr, None), effort, args.provider, model),
+        )
+    return args
 
 
 def main(argv: list[str]) -> int:
+    # Before any TLS happens: on a Mac whose network re-signs HTTPS (school proxy,
+    # antivirus), Python does not see the interception root that macOS already trusts,
+    # and every call dies with "self-signed certificate in certificate chain".
+    net_tls.install()
+
     args = parse_args(argv)
     log(args, f"Pipeline started: mode={args.mode}, input={args.input}, out={args.out}")
+    if args.insecure_ssl:
+        log(args, "  ⚠️ 已跳过 HTTPS 证书校验（--insecure-ssl）。仅在网络拦截证书时才该这样用。")
     if args.init or args.init_only:
         reset_output_dir(args)
         if args.init_only:
@@ -3386,6 +5615,12 @@ def main(argv: list[str]) -> int:
     elif args.mode == "enrich-selected":
         run_enrich_selected(args)
         log(args, f"Pipeline finished successfully: enriched selected items under {Path(args.out)}")
+    elif args.mode == "explain":
+        run_explain(args)
+        log(args, f"Pipeline finished successfully: explained selected items under {Path(args.out)}")
+    elif args.mode == "vocab":
+        run_vocab(args)
+        log(args, f"Pipeline finished successfully: vocabulary extracted under {Path(args.out)}")
     elif args.mode == "assemble":
         run_assemble(args)
         log(args, f"Pipeline finished successfully: wrote assembled markdown under {Path(args.out)}")
@@ -3395,10 +5630,16 @@ def main(argv: list[str]) -> int:
         if str(_scripts_dir) not in sys.path:
             sys.path.insert(0, str(_scripts_dir))
         import export_docx_splice
+        import export_vocab_docx
         docx_out = Path(args.out) / "docx_exports"
+        assert_selection_is_complete(Path(args.out))
         created = export_docx_splice.export_selected(
             Path(args.out), sys.modules[__name__], log=lambda m: log(args, m)
         )
+        # The handout is optional: a run that skipped --mode vocab still exports.
+        vocab_doc = export_vocab_docx.export_vocab(Path(args.out), log=lambda m: log(args, m))
+        if vocab_doc:
+            created.append(vocab_doc)
         log(args, f"Pipeline finished successfully: exported {len(created)} docx file(s) under {docx_out}")
     elif args.mode == "repair-answers":
         run_repair_answers(args)

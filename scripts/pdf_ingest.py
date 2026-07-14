@@ -64,6 +64,38 @@ def _endpoint(base_url: str) -> str:
     return base if base.endswith("/layout-parsing") else f"{base}/layout-parsing"
 
 
+def check_service(base_url: str, token: str, timeout: int = 20) -> tuple[bool, str]:
+    """Is this token/URL pair usable? Answered without uploading a real PDF.
+
+    Deliberately sends a payload the service will reject on *content*: what is being
+    tested is the endpoint and the credentials, and a 401/404 is a different answer
+    from "your file was no good". Anything but an auth or routing failure means the
+    service answered us, which is all the teacher needs to know before starting a run.
+    """
+    request = urllib.request.Request(
+        _endpoint(base_url),
+        data=json.dumps({"file": "", "fileType": 0, "model": MODEL}).encode("utf-8"),
+        headers={"Authorization": f"token {token}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            response.read(200)
+        return True, "服务可访问"
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            return False, f"令牌无效（HTTP {exc.code}）"
+        if exc.code == 404:
+            return False, "服务地址不对（HTTP 404），请核对 aistudio 控制台里的 URL"
+        if exc.code == 429:
+            return False, "免费额度已用完（HTTP 429）"
+        # 400/422 etc: it authenticated us and then rejected the empty file. That is
+        # exactly what we wanted to find out.
+        return True, f"服务可访问（空文件被拒是正常的，HTTP {exc.code}）"
+    except urllib.error.URLError as exc:
+        return False, f"连不上服务：{exc.reason}"
+
+
 def call_api(pdf: Path, *, base_url: str, token: str, timeout: int = 600) -> dict:
     payload = {
         "file": base64.b64encode(pdf.read_bytes()).decode("ascii"),
@@ -207,27 +239,10 @@ def _add_table(doc, html: str) -> None:
         return
 
     table = doc.add_table(rows=len(rows), cols=max(len(r) for r in rows))
-    # Borders are set directly rather than via a "Table Grid" style: the style is
-    # not guaranteed to exist in the template, and referencing a style that
-    # styles.xml never declares is what made Word report unreadable content.
-    _set_borders(table)
+    ds.set_table_borders(table)
     for i, row in enumerate(rows):
         for j, cell in enumerate(row):
             table.cell(i, j).text = ds.sanitize(cell)
-
-
-def _set_borders(table) -> None:
-    from docx.oxml import OxmlElement
-    from docx.oxml.ns import qn
-
-    borders = OxmlElement("w:tblBorders")
-    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
-        line = OxmlElement(f"w:{edge}")
-        line.set(qn("w:val"), "single")
-        line.set(qn("w:sz"), "4")
-        line.set(qn("w:color"), "000000")
-        borders.append(line)
-    table._tbl.tblPr.append(borders)
 
 
 def ingest_pdf(pdf: Path, out_dir: Path, *, base_url: str = "", token: str = "") -> Path:

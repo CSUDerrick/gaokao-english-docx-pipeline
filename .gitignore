@@ -10,3 +10,9 @@ outputs/
 build/
 dist/
 *.spec
+
+# The app's own saved preferences: local runtime state (input/output folders, the
+# models last chosen). Committing it would push one machine's paths onto everyone else,
+# and a stale copy in the repo would fight the schema migration in app/settings.py.
+settings.json
+timings.json
