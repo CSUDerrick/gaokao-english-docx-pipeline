@@ -10,12 +10,37 @@ input_docx/*.docx
   ├─ score            AI     — lightweight scoring per item
   ├─ select           local  — ranking formula, top-2 per section
   ├─ review-select    AI     — pro model re-evaluation (optional)
-  ├─ enrich-selected  AI     — vocab/grammar/sentences for winners
+  ├─ explain          AI     — per-question explanations for winners (teacher edition)
+  ├─ vocab            AI     — the student vocabulary handout (two ways, see below)
   ├─ repair-answers   local  — full-text answer rescan
   ├─ assemble         local  — 3 Markdown outputs
   ├─ quality-report   local  — run_quality_report.md
-  └─ export-docx      local  — Markdown → three styled A4 .docx files
+  └─ export-docx      local  — clone the source papers → four A4 .docx files
 ```
+
+`enrich-selected` (vocab/grammar/long sentences for the winners) was what the
+teacher edition used to carry. It is no longer in the chain — nothing renders that
+data any more — but the mode still exists and can be run by hand. See 决策 13/14.
+
+### vocab — two paths, and the teacher picks (决策 33)
+
+Neither is the correct one; they answer different questions, so 基础模式 puts the choice
+in front of her rather than this file making it for her.
+
+```
+                      完整（--vocab-mode chunked）        困难（--vocab-mode whole，默认）
+输入                  每道选中题的 segment_body            整卷 extracted_text/<卷>.txt
+                      （天然不含答案键）                   （必须先过 trim_answer_tail_from_text）
+调用数                18（每题一次）                       3（每卷一次；卷太大才切块+汇总轮）
+上限                  ≤20 词 / ≤15 变形（每题）            ≤40 词 / ≤25 变形（每卷）
+缓存                  vocab/chunked/<题号>.json            vocab/whole/<卷名>.json
+换一批题              词表过期，必须重跑                    不过期（词属于卷，卷没变）
+词表覆盖              只有学生手上那几道题                  整份卷子（含他没做到的题）
+```
+
+两条路都是「卷间并行、卷内一个 `Conversation`」（决策 8 的前缀缓存，实测命中 99%）。
+产出的每一行都盖上 `vocab_mode`，**导出闸门认这个字段、不认命令行**——老师可能拨了开关
+但没重跑。老词表没有这个字段，就按形状认：有 `item_id` 的是分块。
 
 ## Key files
 
@@ -24,7 +49,10 @@ input_docx/*.docx
 | `scripts/gaokao_english_docx_pipeline.py` | CLI entry point, all modes, local segmenter |
 | `scripts/docx_blocks.py` | Block model — reads docx keeping each paragraph's original OOXML node |
 | `scripts/docx_splice.py` | Clone a source docx keeping chosen paragraphs; merge across papers; validate |
-| `scripts/export_docx_splice.py` | Builds the three Word deliverables from the clones |
+| `scripts/answer_explanation.py` | Finds the paper's own 【N题详解】 blocks, per question, for the teacher edition |
+| `scripts/model_presets.py` | The two quality presets (speed/quality); shared by the CLI and the GUI |
+| `prompts/*.md` | The per-question-type explanation prompts — editable, shipped as bundle data |
+| `scripts/export_docx_splice.py` | Builds the Word deliverables from the clones |
 | `scripts/segment_quality.py` | Shared PASS/PASS*/WARN/FAIL evaluator used by fallback and reports |
 | `scripts/check_segment_quality.py` | Batch segment quality report using shared rules |
 | `gui_app.py` | Education-blue Streamlit GUI with Basic/Advanced/Debug modes |
