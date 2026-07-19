@@ -20,9 +20,36 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-APP_NAME="英语试卷整理工具"
+APP_NAME="AI英语试卷整理工具"
 VERSION="$(grep -m1 '^VERSION = ' app/main.py | cut -d'"' -f2)"
 PY="${PY:-$ROOT/.venv/bin/python}"
+
+# Refuse to build the same version twice. The dmg is named after VERSION and that is how
+# the teacher archives builds, so two different builds under one number are two files she
+# cannot tell apart — and the one already archived is silently not the one she is running.
+# Checked before anything else so it costs a second, not a four-minute build.
+#
+# The record lives here rather than in dist/, which this script wipes on line ~40, and is
+# written only after a build actually succeeds so a failed run does not lock you out.
+STAMP="$ROOT/packaging/.last_built_version"
+if [[ "${ALLOW_SAME_VERSION:-0}" != "1" && -f "$STAMP" && "$(cat "$STAMP")" == "$VERSION" ]]; then
+  # Braces are load-bearing: this text is full-width punctuation, and bash reads the
+  # bytes of 「，」 as part of the name in "$VERSION，" — "unbound variable", not a message.
+  NEXT_BIG="$(echo "$VERSION" | awk -F. '{print $1"."$2+1".0"}')"
+  NEXT_SMALL="$(echo "$VERSION" | awk -F. '{print $1"."$2"."$3+1}')"
+  cat >&2 <<EOF
+❌ 版本号还是 ${VERSION}，和上次打的包同号，已中止。
+
+   老师靠版本号归档，同号的两个 dmg 分不清哪个是哪一版。
+   请先改 app/main.py 里的 VERSION（全项目唯一一处）：
+     大功能 → 大版本号（${VERSION} → ${NEXT_BIG}）
+     小修补 → 小版本号（${VERSION} → ${NEXT_SMALL}）
+
+   确实要重打同一版（刚才构建失败了、或在调打包脚本本身）：
+     ALLOW_SAME_VERSION=1 ./packaging/build_macos.sh
+EOF
+  exit 1
+fi
 
 echo "==> Building $APP_NAME v$VERSION"
 
@@ -63,6 +90,9 @@ rm -rf build dist || rm -rf build dist
   --hidden-import segment_quality \
   --hidden-import segment_repair \
   --hidden-import bundle_paths \
+  --hidden-import input_precheck \
+  --hidden-import answer_pairing \
+  --hidden-import notify \
   --hidden-import gaokao_english_docx_pipeline \
   --collect-all docx \
   --collect-all tokenizers \
@@ -117,6 +147,10 @@ cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
 hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" -ov -format UDZO -quiet "$DMG"
 rm -rf "$STAGE"
+
+# Only now, with a dmg actually on disk: a build that died halfway must not burn the
+# version number and force a pointless bump to retry.
+printf '%s' "$VERSION" > "$STAMP"
 
 echo
 echo "✅ Done"

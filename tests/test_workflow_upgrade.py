@@ -104,7 +104,7 @@ def test_run_segment_replaces_only_abnormal_paper():
         ]
         calls: list[tuple[str, str]] = []
 
-        def fake_segment(docx: Path, args, target: Path) -> list[dict]:
+        def fake_segment(docx: Path, args, target: Path, extra_starts=None, answer_docx=None) -> list[dict]:
             calls.append((docx.name, args.segment_input))
             chosen = sections
             if docx.name == "bad.docx" and args.segment_input == "local":
@@ -138,7 +138,7 @@ def test_run_segment_replaces_only_abnormal_paper():
             repaired.append(missing[0] if missing else "")
             return [(0, "gap_filling", "七选五")]
 
-        def fake_segment_with_extra(docx: Path, args, target: Path, extra_starts=None):
+        def fake_segment_with_extra(docx: Path, args, target: Path, extra_starts=None, answer_docx=None):
             if extra_starts:
                 calls.append((docx.name, "repair"))
                 rows = fake_segment(docx, args, target)
@@ -188,7 +188,7 @@ def test_run_segment_requires_key_when_fallback_is_needed():
         out_dir.mkdir()
         (input_dir / "bad.docx").write_bytes(b"placeholder")
 
-        def fake_warn(docx: Path, args, target: Path) -> list[dict]:
+        def fake_warn(docx: Path, args, target: Path, extra_starts=None, answer_docx=None) -> list[dict]:
             segment_dir = target / "segments"
             segment_dir.mkdir(parents=True, exist_ok=True)
             path = segment_dir / "short.json"

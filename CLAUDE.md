@@ -1,16 +1,22 @@
 # CLAUDE.md
 
-- **Project**: 英语试卷整理工具 (gaokao-english-docx-pipeline)
+- **Project**: AI英语试卷整理工具 (gaokao-english-docx-pipeline)
 - **Goal**: 从 docx 中本地切分提取题目，AI 辅助生成教师讲解，最终重新导出为合规的 docx。
 - **Rules**:
   1. 优先保证正确性，严禁出现破坏文档结构的坏味道。
   2. 绝不修改或污染原始输入数据。
   3. 所有导出结果必须通过底层 XML 校验与自动化压测。
   4. **每次加功能或修 bug 后，都要重新打一个 mac 包**（`./packaging/build_macos.sh`）。
-  5. **测试跑 flash（`--preset speed`），不要默认烧 pro。** 出成品才切 `--preset quality`。
+  5. **打包前必须先改版本号**（`app/main.py` 的 `VERSION`，全项目唯一一处；
+     打包脚本从这里读，用来命名 dmg 和写 Info.plist）。**大功能进大版本号**（`0.8.0 → 0.9.0`），
+     **小修补进小版本号**（`0.9.0 → 0.9.1`）。老师靠版本号归档，两次构建同号就分不清了。
+     **打包脚本会拦**：同号直接中止（记录在 `packaging/.last_built_version`，构建成功才写）。
+     确实要重打同一版（构建失败重试、调打包脚本）用 `ALLOW_SAME_VERSION=1 ./packaging/build_macos.sh`。
+  6. **测试跑 flash（`--preset speed`），不要默认烧 pro。** 出成品才切 `--preset quality`。
 - **Architecture**: 详见 [`docs/architecture.md`](docs/architecture.md)
 - **Current Status**: 详见 [`docs/current_status.md`](docs/current_status.md)
 - **Key decisions**: 详见 [`docs/decisions.md`](docs/decisions.md)
+- **Error playbook（故障手册，每次线上报错都记一条）**: 详见 [`docs/error_playbook.md`](docs/error_playbook.md)
 - **Word compat**: 详见 [`docs/word_compatibility.md`](docs/word_compatibility.md)
 - **Test baseline**: 详见 [`docs/test_results.md`](docs/test_results.md)
 
@@ -101,6 +107,20 @@ streamlit run gui_app.py
 - **导出闸门问的是词表自带的 `vocab_mode`，不是当时的命令行。** 老师可以拨了开关就去导出。
   拿 `args.vocab_mode` 去判，会用分块的规矩卡掉一份完全合格的整卷词表。
   盘上的老词表没有这个字段——按**形状**认（有 `item_id` 的是分块），统一给个默认值会认错一半。
+
+- **答案可以在另一份文档里（决策 34）。** 「学生版试卷 + 答案文档」两份进来时：
+  - **认答案文档看「答案键在哪」，不看「有没有题」**——真答案文档的**参考范文会被切成 2 道写作题**，
+    `_find_answer_section_start` 还会把答案区定位到**听力录音稿**。两个信号都会骗你。
+    没有哪张卷子拿答案键开头（实测 0.3% vs 63%），这才是那个信号（`segment_quality.first_answer_run`）。
+  - **答案文档整篇就是答案区，要整份取。** 对它再跑尾部检测会切在「听力录音稿」，
+    而**参考范文在它上面**——范文全丢，写作题答案直接变空。
+  - **解析块走 `official_explanation_path`，题目块永远只从原卷克隆。** 留空 = 同一个文件。
+  - **不确定就不配。** 文件名只提名，flash 复核拍板；说不准就按「原卷未提供答案」走。
+
+- **PaddleOCR 是异步 job API（提交→轮询→下载 JSONL），`bearer` 鉴权，一个全局地址。**
+  它现在也在轮询，所以 `convert_pdfs` **必须给它传 `sleep=_sleep_or_cancel`**，否则取消无效。
+  服务地址是可选覆盖，别再把它变成必填。图片是 URL 不是 base64。
+  **没有 `block_order` 的块（表格）不能当成 0**——那会让每张表跳到该页最上面。
 
 - **`chat_payload()` 里不许再出现任何厂商专属字段。** 全部交给 `providers.request_fields()`，
   它返回 `(standard, extras)`：`extras` 是非 OpenAI 标准的扩展（DeepSeek 的 `thinking`、

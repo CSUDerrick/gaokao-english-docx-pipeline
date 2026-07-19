@@ -76,6 +76,23 @@ P_PR_ORDER = (
     "sectPr", "pPrChange",
 )
 
+# EG_RPrBase is a sequence too: w:rFonts sits near the front, w:sz well after the
+# toggles, and w:rPrChange must be last. Same treatment as pPr — append whatever we
+# add and then sort into this order rather than trust where it landed.
+R_PR_ORDER = (
+    "rStyle", "rFonts", "b", "bCs", "i", "iCs", "caps", "smallCaps", "strike",
+    "dstrike", "outline", "shadow", "emboss", "imprint", "noProof", "snapToGrid",
+    "vanish", "webHidden", "color", "spacing", "w", "kern", "position", "sz",
+    "szCs", "highlight", "u", "effect", "bdr", "shd", "fitText", "vertAlign",
+    "rtl", "cs", "em", "lang", "eastAsianLayout", "specVanish", "oMath", "rPrChange",
+)
+
+# The single house style the teacher asked every exported file to share: 小四 body,
+# English in Times New Roman, 中文 in 宋体. 小四 = 12pt = 24 half-points.
+BODY_HALF_POINTS = 24
+ASCII_FONT = "Times New Roman"
+EAST_ASIA_FONT = "宋体"
+
 
 def _reorder(pr, order: tuple[str, ...]) -> None:
     """Sort a properties element's children into the schema's required sequence."""
@@ -406,6 +423,95 @@ def page_break_before(paragraph) -> None:
     pageBreakBefore survives the list getting longer or shorter.
     """
     _paragraph_layout(paragraph._p.get_or_add_pPr(), page_break=True)
+
+
+def _force_run_typography(rpr, half_points: int) -> None:
+    """Pin one run's font family and size, leaving bold/italic/underline alone.
+
+    English → Times New Roman, 中文 → 宋体, size → the requested half-points (小四 by
+    default). Everything is *set*, never left to inherit, because the question runs
+    are cloned out of a dozen source papers each authored in its own font, and the
+    teacher wants one look across the handout. ``w:hint`` is dropped: it would send
+    Word hunting for the font we just replaced, and the explicit ascii/eastAsia split
+    already tells it which family each script uses.
+    """
+    fonts = rpr.find(qn("w:rFonts"))
+    if fonts is None:
+        fonts = OxmlElement("w:rFonts")
+        rpr.append(fonts)
+    fonts.set(qn("w:ascii"), ASCII_FONT)
+    fonts.set(qn("w:hAnsi"), ASCII_FONT)
+    fonts.set(qn("w:cs"), ASCII_FONT)
+    fonts.set(qn("w:eastAsia"), EAST_ASIA_FONT)
+    if fonts.get(qn("w:hint")) is not None:
+        del fonts.attrib[qn("w:hint")]
+    for tag in ("sz", "szCs"):
+        size = rpr.find(qn(f"w:{tag}"))
+        if size is None:
+            size = OxmlElement(f"w:{tag}")
+            rpr.append(size)
+        size.set(qn("w:val"), str(half_points))
+    _reorder(rpr, R_PR_ORDER)
+
+
+def _force_paragraph_layout(ppr, half_points: int) -> None:
+    """Overwrite one paragraph's spacing/grid with the teacher's house style.
+
+    Single line spacing, no space before or after, snap-to-grid off, and the
+    「相同样式段落间不添加空格」 box left unticked (``w:contextualSpacing`` removed,
+    never emitted). Indentation, alignment, numbering and the paragraph style are
+    left untouched — those carry the question's structure, not its house style.
+    The paragraph mark's own font is matched too, so an empty line is 宋体/TNR.
+    """
+    for extra in ppr.findall(qn("w:contextualSpacing")):
+        ppr.remove(extra)
+
+    snap = ppr.find(qn("w:snapToGrid"))
+    if snap is None:
+        snap = OxmlElement("w:snapToGrid")
+        ppr.append(snap)
+    snap.set(qn("w:val"), "0")
+
+    spacing = ppr.find(qn("w:spacing"))
+    if spacing is None:
+        spacing = OxmlElement("w:spacing")
+        ppr.append(spacing)
+    spacing.set(qn("w:before"), "0")
+    spacing.set(qn("w:after"), "0")
+    spacing.set(qn("w:line"), "240")
+    spacing.set(qn("w:lineRule"), "auto")
+
+    mark = ppr.find(qn("w:rPr"))
+    if mark is None:
+        mark = OxmlElement("w:rPr")
+        ppr.append(mark)
+    _force_run_typography(mark, half_points)
+
+    _reorder(ppr, P_PR_ORDER)
+
+
+def normalize_format(path: Path, half_points: int = BODY_HALF_POINTS) -> None:
+    """Give a finished .docx one house style: 小四, Times New Roman + 宋体, single spaced.
+
+    决策 11 keeps each question's *original* typesetting when it is cloned, which is
+    right for structure (indents, tables, the underline that draws a blank) but means
+    forty questions arrive in forty different fonts and line heights. The teacher
+    asked for every exported file to read the same, so once the parts are merged this
+    walks the whole body — question clones, cloned tables (``iter`` descends into
+    ``w:tbl``), and the generated headings/notes alike — and pins font family, size,
+    line spacing and the two Word checkboxes. Bold, italics, underlines, indentation
+    and alignment survive untouched.
+
+    Runs first, then paragraphs, both materialised before mutating so adding a pPr/rPr
+    mid-walk cannot disturb the iteration.
+    """
+    doc = Document(str(path))
+    body = doc.element.body
+    for para in list(body.iter(qn("w:p"))):
+        _force_paragraph_layout(para.get_or_add_pPr(), half_points)
+    for run in list(body.iter(qn("w:r"))):
+        _force_run_typography(run.get_or_add_rPr(), half_points)
+    doc.save(str(path))
 
 
 def decorate(path: Path, heading: str = "", notes: list[tuple[str, str]] | None = None) -> None:

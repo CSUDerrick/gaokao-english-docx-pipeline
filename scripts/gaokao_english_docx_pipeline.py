@@ -43,9 +43,12 @@ from pathlib import Path
 from typing import Iterable
 from xml.etree import ElementTree as ET
 
+import answer_pairing
 import deepseek_tokens
+import input_precheck
 import model_presets as mp
 import net_tls
+import notify as notify_mod
 import providers as pv
 from answer_explanation import (
     SECTION_QUESTION_RANGES,
@@ -54,7 +57,12 @@ from answer_explanation import (
 )
 from bundle_paths import prompt_dir
 from docx_blocks import DocxDoc, find_block_range, read_docx
-from segment_quality import evaluate_document
+from segment_quality import (
+    READING_SECTIONS,
+    evaluate_document,
+    first_answer_run,
+    missing_question_numbers,
+)
 from segment_repair import locate_missing_sections
 
 
@@ -826,6 +834,7 @@ def make_local_segment(
     source_path: str = "",
     source_blocks: list[int] | None = None,
     official_explanation_blocks: list[int] | None = None,
+    official_explanation_path: str = "",
 ) -> dict:
     return {
         "source_doc": source_doc,
@@ -851,6 +860,12 @@ def make_local_segment(
         # cheap to re-read from the source when the teacher edition is built.
         # Empty when the paper never explained these questions.
         "official_explanation_blocks": official_explanation_blocks or [],
+        # Which file those indices point into. Normally the paper itself, but a paper
+        # can arrive as a student edition plus a *separate* answers document, and then
+        # the explanation blocks live in that other file while the questions stay here.
+        # Empty means "the same file as the questions", which is what every segment
+        # written before this field existed means too.
+        "official_explanation_path": official_explanation_path or "",
     }
 
 
@@ -919,6 +934,9 @@ def local_segment_paper(
     text: str,
     doc: DocxDoc | None = None,
     extra_starts: list[tuple[int, str, str]] | None = None,
+    answer_doc: DocxDoc | None = None,
+    answer_text: str = "",
+    answer_path: str = "",
 ) -> list[dict]:
     """Split a paper into questions.
 
@@ -927,20 +945,32 @@ def local_segment_paper(
     back in here — rather than being patched on afterwards — so the recovered
     section gets its answer key and block range by exactly the same code as every
     other section.
+
+    ``answer_doc``/``answer_text`` are a *separate* answers document paired to this
+    paper (a student edition whose answers came as their own file). When given, the
+    answers and 详解 are read out of that document instead of this paper's tail — the
+    questions still come from this one. Everything after that point is identical, so
+    a paired paper and a self-contained one segment by the same code.
     """
     body, body_offset = trim_answer_tail_with_offset(text)
-    answer_tail = extract_answer_tail(text, max_chars=30000)
-    # Use full-text scan for robust answer extraction (handles table format,
-    # double-hyphen ranges, concatenated grammar answers, etc.)
-    full_answers = extract_all_answers_from_full_text(text)
-    # The answer section is cut out of the body above, but the teacher edition
-    # clones the paper's own 【N题详解】 blocks back in, so index them before the
-    # boundary is forgotten.
-    official = (
-        OfficialExplanations(doc, _find_answer_section_start(text))
-        if doc is not None
-        else None
-    )
+    if answer_doc is not None:
+        # A dedicated answers document *is* the answer region, start to finish — so it is
+        # taken whole. Running the tail detector over it instead cuts it at the first
+        # header that matches, and on a real one that is 听力录音稿, which sits *below* the
+        # 参考范文: the essays above it were thrown away and both writing sections came
+        # back with no answer at all.
+        answer_tail = answer_text[:30000]
+        full_answers = extract_all_answers_from_full_text(answer_text)
+        official = OfficialExplanations(answer_doc, 0)
+    else:
+        answer_tail = extract_answer_tail(text, max_chars=30000)
+        # Use full-text scan for robust answer extraction (handles table format,
+        # double-hyphen ranges, concatenated grammar answers, etc.)
+        full_answers = extract_all_answers_from_full_text(text)
+        # The answer section is cut out of the body above, but the teacher edition
+        # clones the paper's own 【N题详解】 blocks back in, so index them before the
+        # boundary is forgotten.
+        official = OfficialExplanations(doc, _find_answer_section_start(text)) if doc is not None else None
     lines = line_spans(body)
     starts: list[tuple[int, str, str]] = []
 
@@ -1080,6 +1110,9 @@ def local_segment_paper(
                 source_doc, section, label, qtext, ak, answer_source,
                 source_path=source_path, source_blocks=source_blocks,
                 official_explanation_blocks=explanation_blocks,
+                # Only set when the answers came from their own document; empty keeps
+                # the old meaning, "the same file the questions came from".
+                official_explanation_path=answer_path if answer_doc is not None else "",
             )
         )
     return segments
@@ -2553,7 +2586,15 @@ def convert_pdfs(args: argparse.Namespace, out_dir: Path) -> list[Path]:
             log(args, f"  OCR {pdf.name} via PaddleOCR-VL …")
             converted.append(
                 pdf_ingest.ingest_pdf(
-                    pdf, converted_dir, base_url=args.paddle_base_url, token=args.paddle_token
+                    pdf,
+                    converted_dir,
+                    base_url=args.paddle_base_url,
+                    token=args.paddle_token,
+                    # PaddleOCR is a poll loop now too (it used to be one blocking POST,
+                    # which is why it never needed this). Same reason as MinerU: without
+                    # it 取消 does nothing until the OCR finishes on its own.
+                    sleep=_sleep_or_cancel,
+                    log=lambda message: log(args, message),
                 )
             )
     return converted
@@ -2877,6 +2918,7 @@ def segment_docx_file(
     args: argparse.Namespace,
     out_dir: Path,
     extra_starts: list[tuple[int, str, str]] | None = None,
+    answer_docx: Path | None = None,
 ) -> list[dict]:
     # Local segmentation is fast (well under a second per paper), so checking between
     # papers is effectively instant — 取消 needs no confirmation on this stage.
@@ -2894,8 +2936,21 @@ def segment_docx_file(
     text_path = extracted_dir / f"{safe_stem(source_doc)}.txt"
     text_path.write_text(text, encoding="utf-8")
 
+    # A student edition whose answers came as their own file. Its text is written out
+    # under its own name too, so --mode repair-answers can find it later.
+    answer_doc = None
+    answer_text = ""
+    if answer_docx is not None:
+        answer_doc = read_docx(answer_docx)
+        answer_text = answer_doc.text
+        (extracted_dir / f"{safe_stem(answer_docx.name)}.txt").write_text(answer_text, encoding="utf-8")
+
     if args.segment_input == "local":
-        segments = local_segment_paper(source_doc, text, doc, extra_starts)
+        segments = local_segment_paper(
+            source_doc, text, doc, extra_starts,
+            answer_doc=answer_doc, answer_text=answer_text,
+            answer_path=str(answer_docx) if answer_docx is not None else "",
+        )
         write_json(rough_dir / f"{safe_stem(source_doc)}__local_segments.json", segments)
         counters: dict[str, int] = {}
         rows: list[dict] = []
@@ -3012,6 +3067,100 @@ def segment_docx_file(
     return rows
 
 
+def confirm_pairing(args: argparse.Namespace, paper: str, paper_head: str,
+                    answers: str, answers_head: str) -> dict:
+    """Ask the fast model whether this answers document really belongs to this paper.
+
+    Filenames are the cheap signal and they are often enough, but they are also often a
+    scan named 扫描件2.pdf. Getting this wrong prints B 卷's answer key under A 卷's
+    questions, so the名字 only ever *proposes* — this is what decides.
+    """
+    provider = pv.get(getattr(args, "provider", pv.DEFAULT_PROVIDER))
+    prompt = (
+        "下面是两份文档的文件名和开头。第一份是一张英语试卷（题目），"
+        "第二份看起来是一份答案/解析文档。请判断：**第二份是不是第一份这张卷子的答案**？\n"
+        "看题号范围、题型顺序、专有名词、卷子名称是否对得上。拿不准就答 false——"
+        "配错答案比没有答案严重得多。\n"
+        '只输出 JSON：{"ok": true 或 false, "reason": "一句话"}，JSON 的语法符号用英文半角引号。\n\n'
+        f"# 试卷：{paper}\n----\n{paper_head}\n----\n\n"
+        f"# 疑似答案：{answers}\n----\n{answers_head}\n----"
+    )
+    result = call_stage_model(
+        args, prompt, model=provider.role_model(pv.FLASH),
+        reasoning_effort=getattr(args, "segment_reasoning_effort", "high"),
+        thinking="disabled", max_tokens=300, stage="pairing", item_id=f"{paper} ← {answers}",
+    )
+    parsed = parse_model_json(result.content)
+    if isinstance(parsed, dict):
+        return parsed
+    return {"ok": None, "reason": (result.content or "").strip()[:200]}
+
+
+def pair_answer_docs(args: argparse.Namespace, docx_files: list[Path],
+                     texts: dict[Path, str]) -> tuple[dict[Path, Path], list[Path]]:
+    """Work out which files are papers, which are answers, and what goes with what.
+
+    Returns ``(pairing, answer_only)``: the papers to segment keep their own entry in
+    ``pairing`` (mapping to the answers document, when one was matched), and every file
+    in ``answer_only`` is dropped from segmentation — it is not a paper, and segmenting
+    it produces zero questions, a FAIL, and a dead run.
+    """
+    kinds: dict[Path, str] = {}
+    for path in docx_files:
+        text = texts.get(path, "")
+        try:
+            found = len(local_segment_paper(path.name, text))
+        except Exception:
+            found = 0
+        kinds[path] = answer_pairing.classify(
+            path.name, found, _find_answer_section_start(text), len(text),
+            first_answer_pos=first_answer_run(text),
+        )
+
+    papers = [p for p in docx_files if kinds[p] in (answer_pairing.PAPER, answer_pairing.BOTH, answer_pairing.UNKNOWN)]
+    answers = [p for p in docx_files if kinds[p] == answer_pairing.ANSWERS]
+    if not answers:
+        return {}, []
+
+    # Only a paper that has no answers of its own needs a pairing; a self-contained one
+    # already has them, and overwriting that with a guess would be a downgrade.
+    needy = [p for p in papers if kinds[p] != answer_pairing.BOTH]
+    log(args, f"  输入里有 {len(answers)} 份看起来是「答案文档」，{len(needy)} 张卷子没有自带答案，尝试配对…")
+
+    by_name = {p.name: p for p in docx_files}
+    proposals = answer_pairing.propose_pairs([p.name for p in needy], [a.name for a in answers])
+    pairing: dict[Path, Path] = {}
+    paired_answers: set[Path] = set()
+    for paper_name, answer_name, score in proposals:
+        paper, answer = by_name[paper_name], by_name[answer_name]
+        verdict = {"ok": True, "reason": f"文件名高度一致（{score:.2f}）"}
+        if getattr(args, "pairing_confirm", True):
+            try:
+                verdict = confirm_pairing(
+                    args, paper_name, texts.get(paper, "")[:1500],
+                    answer_name, texts.get(answer, "")[:1500],
+                )
+            except Exception as exc:  # noqa: BLE001
+                verdict = {"ok": None, "reason": f"复核调用失败：{exc}"}
+        if verdict.get("ok") is True:
+            pairing[paper] = answer
+            paired_answers.add(answer)
+            log(args, f"    ✅ 配对：{paper_name} ← {answer_name}（{verdict.get('reason') or ''}）")
+        else:
+            # Refusing to pair is the safe outcome: the paper simply has no answers, which
+            # the rest of the pipeline already knows how to say.
+            log(args, f"    ⚠️ 不配对：{paper_name} ← {answer_name}（{verdict.get('reason') or '模型未确认'}）")
+
+    for answer in answers:
+        if answer not in paired_answers:
+            log(args, f"    ⚠️ 「{answer.name}」没能配到任何一张卷子，已跳过（不会被当成试卷）。")
+    for paper in needy:
+        if paper not in pairing:
+            log(args, f"    ⚠️ 「{paper.name}」没有配到答案，将按「原卷未提供答案」处理。")
+
+    return pairing, answers
+
+
 def run_segment(args: argparse.Namespace) -> list[dict]:
     out_dir = Path(args.out)
     ensure_dir(out_dir)
@@ -3026,13 +3175,56 @@ def run_segment(args: argparse.Namespace) -> list[dict]:
     if not docx_files:
         raise SystemExit(f"No .docx or .pdf files found under {args.input}")
 
+    # One read of each file's text, shared by the smoke check and the answer-document
+    # pairing below: both need it, and reading a docx twice is not free.
+    texts: dict[Path, str] = {}
+    for docx in docx_files:
+        try:
+            texts[docx] = extract_docx_text(docx)
+        except Exception:
+            # A file we cannot even read as text here will fail loudly inside
+            # segmentation itself; these checks must not add a second failure mode.
+            continue
+
+    # Free local smoke check on the extracted text, so an obviously broken input (OCR
+    # mojibake, near-empty scan) is flagged even on a straight stage1 run that never
+    # touched --mode preflight. Warn-only; no model call here, escalation lives in preflight.
+    input_suspects = [
+        f"{docx.name}：{'；'.join(input_precheck.precheck_text(text)['reasons'])}"
+        for docx, text in texts.items()
+        if input_precheck.precheck_text(text)["suspect"]
+    ]
+    if input_suspects:
+        log(args, f"  ⚠️ 输入预检发现 {len(input_suspects)} 份卷子可疑（仅警告，继续切分；建议先跑 --mode preflight 复核）：")
+        for line in input_suspects:
+            log(args, f"    - {line}")
+
+    # Some papers arrive as a student edition plus a separate 答案 document. Match them up
+    # before segmenting: an answers document is not a paper, and putting one through the
+    # segmenter yields zero questions, a structural FAIL, and a dead run.
+    pairing: dict[Path, Path] = {}
+    answer_only: list[Path] = []
+    if getattr(args, "answer_pairing", True) and args.segment_input == "local":
+        pairing, answer_only = pair_answer_docs(args, docx_files, texts)
+        if pairing:
+            write_json(
+                out_dir / "answer_pairing.json",
+                {paper.name: answer.name for paper, answer in pairing.items()},
+            )
+    docx_files = [d for d in docx_files if d not in answer_only]
+    if not docx_files:
+        raise SystemExit("输入里只有答案文档，没有任何试卷。请把试卷也放进来。")
+
     if args.segment_input == "local":
         log(args, f"Segmenting {len(docx_files)} docx file(s) locally; no segment API calls will be made.")
     else:
         log(args, f"Segmenting {len(docx_files)} docx file(s) with {args.segment_model}; workers={args.segment_workers}.")
     rows: list[dict] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.segment_workers)) as executor:
-        future_map = {executor.submit(segment_docx_file, docx, args, out_dir): docx for docx in docx_files}
+        future_map = {
+            executor.submit(segment_docx_file, docx, args, out_dir, None, pairing.get(docx)): docx
+            for docx in docx_files
+        }
         for future in concurrent.futures.as_completed(future_map):
             docx = future_map[future]
             try:
@@ -3098,7 +3290,11 @@ def run_segment(args: argparse.Namespace) -> list[dict]:
                 )
                 if not extra:
                     return []
-                return segment_docx_file(path, args, out_dir, extra_starts=extra)
+                # Keep the paired answers document across the re-cut: dropping it here
+                # would hand back a repaired paper with its answers silently gone.
+                return segment_docx_file(
+                    path, args, out_dir, extra_starts=extra, answer_docx=pairing.get(path)
+                )
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.segment_workers)) as executor:
                 future_map = {executor.submit(repair_paper, doc): doc for doc in needs_fallback}
@@ -3337,6 +3533,37 @@ def score_for_selection(section: str, score: dict) -> float:
     return rec + novelty + difficulty + exam
 
 
+def drop_incomplete_reading(candidates: list[dict], section: str, args: argparse.Namespace) -> list[dict]:
+    """Filter out reading candidates whose source paper is missing questions.
+
+    Local scoring is deterministic, so a paper that dropped 阅读B's questions (see
+    决策 35) would be picked every single run — the teacher presses 重新选题 and gets the
+    same broken passage back. Removing it here lets a complete paper take the slot.
+    Never empties a section, though: if *every* candidate is defective, keep them and
+    leave the shout to the export gate rather than silently produce nothing.
+    """
+    if section not in READING_SECTIONS:
+        return candidates
+    kept: list[dict] = []
+    for row in candidates:
+        seg_path = row.get("segment_path")
+        segment: object = {}
+        if seg_path:
+            try:
+                segment = read_json(Path(seg_path))
+            except Exception:
+                segment = {}
+        missing = missing_question_numbers(segment) if isinstance(segment, dict) else []
+        if missing:
+            log(args, f"  跳过 {section_display(section)}·{row.get('source_doc', '')}：原卷缺第 {', '.join(missing)} 题，不参与选题。")
+        else:
+            kept.append(row)
+    if not kept:
+        log(args, f"  警告：{section_display(section)} 的候选全部缺题，暂不过滤（导出闸门会拦下）。")
+        return candidates
+    return kept
+
+
 def run_select(args: argparse.Namespace) -> list[dict]:
     out_dir = Path(args.out)
     score_path = out_dir / "score_index.jsonl"
@@ -3346,6 +3573,7 @@ def run_select(args: argparse.Namespace) -> list[dict]:
     selected: list[dict] = []
     for section, target_count in SELECTION_TARGETS.items():
         candidates = [row for row in score_rows if row.get("section") == section]
+        candidates = drop_incomplete_reading(candidates, section, args)
         for row in candidates:
             row_score = row.get("score", {})
             row["selection_score"] = score_for_selection(section, row_score if isinstance(row_score, dict) else {})
@@ -3446,6 +3674,7 @@ def run_review_select(args: argparse.Namespace) -> list[dict]:
 
     for section, target_count in SELECTION_TARGETS.items():
         candidates = [row for row in score_rows if row.get("section") == section]
+        candidates = drop_incomplete_reading(candidates, section, args)
         for row in candidates:
             score = row.get("score", {})
             row["selection_score"] = score_for_selection(section, score if isinstance(score, dict) else {})
@@ -4114,7 +4343,10 @@ def official_explanation_text(segment: dict) -> str:
     skips four whole sections, and there the model writes the explanation alone.
     """
     span = segment.get("official_explanation_blocks") or []
-    source = segment.get("source_path") or ""
+    # Usually the paper itself, but a student edition's answers can live in a separate
+    # document; then the indices point into that one. Falling back to source_path keeps
+    # every segment written before the field existed working unchanged.
+    source = segment.get("official_explanation_path") or segment.get("source_path") or ""
     if len(span) == 2 and source and Path(source).exists():
         text = blocks_text(cached_docx(source), span)
         if text:
@@ -4147,13 +4379,21 @@ JSON_REPAIR_TURN = (
     "不要用代码块包裹，不要加任何解释。"
 )
 
+# How many corrective turns to allow before giving up. One was not enough for the big
+# nested 读后续写 JSON: the model rendered its own braces in Chinese quotes, the single
+# repair turn said "don't" and it did it again, and the whole paper failed. Each retry
+# re-reads a cached prefix, so a couple more attempts is nearly free.
+JSON_REPAIR_MAX_TURNS = 2
 
-def _repair_instruction(content: str) -> str:
+
+def _repair_instruction(content: str, echo: bool = False) -> str:
     """Name the actual mistake. A generic scolding just produces the same reply again."""
     head = content.lstrip()[:400]
-    if "“" in head or "”" in head:
-        return JSON_REPAIR_SMART_QUOTES
-    return JSON_REPAIR_TURN
+    base = JSON_REPAIR_SMART_QUOTES if ("“" in head or "”" in head) else JSON_REPAIR_TURN
+    if echo and head:
+        # By the second try, show the model its own opening so it can see where it broke.
+        return f"{base}\n\n你上一条的开头是：\n{head[:200]}\n\n就是这里坏了，请对照上面的规则改对。"
+    return base
 
 
 def ask_for_json(
@@ -4195,16 +4435,174 @@ def ask_for_json(
     if isinstance(parsed, dict):
         return parsed, result, usages
 
-    # Truncation is a different failure: retrying it just truncates again, and
-    # require_parsed says so with the token counts. Only offer the repair turn
-    # when there was room to answer.
-    produced = int((result.usage or {}).get("completion_tokens") or 0)
-    if max_tokens and produced >= max_tokens:
-        return parsed, result, usages
+    # A few corrective turns, not one. Each retry re-reads a cached prefix inside the
+    # conversation, so it is nearly free, and the big nested writing JSON sometimes needs
+    # a second nudge before the model stops rendering its braces in Chinese quotes.
+    for attempt in range(JSON_REPAIR_MAX_TURNS):
+        # Truncation is a different failure: retrying just truncates again, and
+        # require_parsed says so with the token counts. Only offer a repair turn when
+        # there was room to answer.
+        produced = int((result.usage or {}).get("completion_tokens") or 0)
+        if max_tokens and produced >= max_tokens:
+            return parsed, result, usages
+        result = ask(_repair_instruction(result.content, echo=attempt > 0))
+        usages.append(result.usage if isinstance(result.usage, dict) else {})
+        parsed = parse_model_json(result.content)
+        if isinstance(parsed, dict):
+            return parsed, result, usages
 
-    retry = ask(_repair_instruction(result.content))
-    usages.append(retry.usage if isinstance(retry.usage, dict) else {})
-    return parse_model_json(retry.content), retry, usages
+    return parsed, result, usages
+
+
+def dump_failure(
+    out_dir: Path,
+    kind: str,
+    item_id: str,
+    prompt: str,
+    chat_result: ChatResult,
+    error: object,
+    *,
+    provider: str = "",
+    model: str = "",
+    preset: str = "",
+) -> Path:
+    """Keep the whole broken reply, not the 200 chars the error prints.
+
+    A JSON that breaks its own syntax is worth looking at in full, and grepping
+    ``api_conversations`` after the fact stops working the moment "keep intermediates"
+    is off. So on a hard parse failure we write the entire model output, the prompt we
+    sent, and the run's coordinates to ``<out>/failures/`` for a post-mortem.
+    """
+    failures = out_dir / "failures"
+    ensure_dir(failures)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    path = failures / f"{stamp}_{safe_filename(item_id)}.md"
+    usage = chat_result.usage if isinstance(chat_result.usage, dict) else {}
+    produced = usage.get("completion_tokens")
+    lines = [
+        f"# {kind} 解析失败：{item_id}",
+        "",
+        f"- 时间：{stamp}",
+        f"- provider / model：{provider or '?'} / {model or '?'}",
+        f"- preset：{preset or '?'}",
+        f"- completion_tokens：{produced}",
+        f"- 报错：{error}",
+        "",
+        "## 模型原始输出（完整）",
+        "",
+        "```",
+        str(chat_result.content or ""),
+        "```",
+        "",
+        "## 发出去的 prompt",
+        "",
+        "```",
+        prompt,
+        "```",
+        "",
+    ]
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
+
+
+# 读后续写 / 应用文默认给几个思路（老师上课对比着讲「同一题可以怎么写」）。
+WRITING_IDEA_COUNT = 3
+
+
+def _writing_idea_prompt(ordinal: int, prior_angles: list[str]) -> str:
+    """The short follow-up that asks for one more idea, inside the same conversation."""
+    template = (prompt_dir() / "writing_more_idea.md").read_text(encoding="utf-8")
+    if prior_angles:
+        prior = "（前面已经给过的角度：" + "；".join(a for a in prior_angles if a) + "）"
+    else:
+        prior = ""
+    return (
+        template
+        .replace("{{IDEA_ORDINAL}}", str(ordinal))
+        .replace("{{PRIOR_ANGLES}}", prior)
+    )
+
+
+def _normalize_idea(piece: object) -> dict | None:
+    """One idea turn should return a single {角度,提纲,范文,...} object; accept the
+    wrappers a model reaches for (a ``思路`` key, or a one-element list)."""
+    if not isinstance(piece, dict):
+        return None
+    inner = piece.get("思路")
+    if isinstance(inner, list) and inner:
+        inner = inner[0]
+    if isinstance(inner, dict):
+        return inner
+    if any(key in piece for key in ("范文", "角度", "提纲")):
+        return piece
+    return None
+
+
+def explain_writing(
+    conversation: "Conversation | None",
+    args: argparse.Namespace,
+    out_dir: Path,
+    segment: dict,
+    section: str,
+    official: str,
+    item_id: str,
+) -> tuple[dict, list[dict], list[str]]:
+    """Ask for a writing item in small pieces instead of one giant nested JSON.
+
+    读后续写 used to come back as 审题 + 2–3 full essays + 亮点 in a single object — the
+    shape most likely to break its own JSON, and one broken essay failed the whole paper.
+    Here the brief (审题 + 评分要点) is one small turn and each idea is another, each a
+    small JSON re-reading a cached prefix. The merged result is the exact shape
+    ``render_explanation`` already expects, so export is untouched.
+    """
+    usages: list[dict] = []
+    clients: list[str] = []
+
+    def one_turn(prompt: str, label: str) -> dict:
+        parsed, chat_result, turn_usages = ask_for_json(
+            conversation, args, prompt,
+            model=args.explain_model,
+            reasoning_effort=args.explain_reasoning_effort,
+            thinking=args.explain_thinking,
+            max_tokens=args.explain_max_tokens,
+            stage="explain", item_id=item_id,
+        )
+        save_api_conversation(out_dir, "explain", label, prompt, chat_result, args)
+        usages.extend(turn_usages)
+        clients.append(chat_result.client_used)
+        try:
+            return require_parsed(
+                parsed, chat_result, args.explain_max_tokens, "explain", label,
+                provider=getattr(args, "provider", ""), model=args.explain_model,
+            )
+        except RuntimeError as exc:
+            dump_failure(
+                out_dir, "explain", label, prompt, chat_result, exc,
+                provider=getattr(args, "provider", ""), model=args.explain_model,
+                preset=getattr(args, "preset", ""),
+            )
+            raise
+
+    brief = one_turn(build_explain_prompt(segment, section, [], official), item_id)
+    merged: dict = {
+        "审题": brief.get("审题"),
+        "评分要点": brief.get("评分要点", ""),
+        "思路": [],
+    }
+    prior_angles: list[str] = []
+    for k in range(1, WRITING_IDEA_COUNT + 1):
+        raise_if_cancelled()
+        piece = one_turn(_writing_idea_prompt(k, prior_angles), f"{item_id}__idea{k}")
+        idea = _normalize_idea(piece)
+        if idea is None:
+            continue
+        merged["思路"].append(idea)
+        angle = str(idea.get("角度", "") or "").strip()
+        if angle:
+            prior_angles.append(angle)
+    if not merged["思路"]:
+        raise RuntimeError(f"explain 写作题一个思路都没生成：{item_id}")
+    return merged, usages, clients
 
 
 def explain_one_selected(
@@ -4240,32 +4638,50 @@ def explain_one_selected(
     merged: dict = {}
     usages: list[dict] = []
     clients: list[str] = []
-    for chunk in explain_chunks(section, numbers):
-        raise_if_cancelled()
-        prompt = build_explain_prompt(segment, section, chunk, official)
-        parsed, chat_result, turn_usages = ask_for_json(
-            conversation,
-            args,
-            prompt,
-            model=args.explain_model,
-            reasoning_effort=args.explain_reasoning_effort,
-            thinking=args.explain_thinking,
-            max_tokens=args.explain_max_tokens,
-            stage="explain",
-            item_id=item_id,
+    if section in WRITING_SECTIONS:
+        # Writing has no numbered questions; it comes back as a brief plus a few ideas,
+        # each its own small turn (see explain_writing).
+        merged, usages, clients = explain_writing(
+            conversation, args, out_dir, segment, section, official, item_id
         )
-        label = item_id if len(numbers) == len(chunk) else f"{item_id}__q{chunk[0]}"
-        save_api_conversation(out_dir, "explain", label, prompt, chat_result, args)
-        piece = require_parsed(parsed, chat_result, args.explain_max_tokens, "explain", label)
-        usages.extend(turn_usages)
-        clients.append(chat_result.client_used)
+    else:
+        for chunk in explain_chunks(section, numbers):
+            raise_if_cancelled()
+            prompt = build_explain_prompt(segment, section, chunk, official)
+            parsed, chat_result, turn_usages = ask_for_json(
+                conversation,
+                args,
+                prompt,
+                model=args.explain_model,
+                reasoning_effort=args.explain_reasoning_effort,
+                thinking=args.explain_thinking,
+                max_tokens=args.explain_max_tokens,
+                stage="explain",
+                item_id=item_id,
+            )
+            label = item_id if len(numbers) == len(chunk) else f"{item_id}__q{chunk[0]}"
+            save_api_conversation(out_dir, "explain", label, prompt, chat_result, args)
+            try:
+                piece = require_parsed(
+                    parsed, chat_result, args.explain_max_tokens, "explain", label,
+                    provider=getattr(args, "provider", ""), model=args.explain_model,
+                )
+            except RuntimeError as exc:
+                dump_failure(
+                    out_dir, "explain", label, prompt, chat_result, exc,
+                    provider=getattr(args, "provider", ""), model=args.explain_model,
+                    preset=getattr(args, "preset", ""),
+                )
+                raise
+            usages.extend(turn_usages)
+            clients.append(chat_result.client_used)
 
-        # Question-by-question sections come back as {"questions": [...]}; the two
-        # writing sections have their own shape and are never chunked.
-        if "questions" in piece:
-            merged.setdefault("questions", []).extend(piece.get("questions") or [])
-        else:
-            merged.update(piece)
+            # Question-by-question sections come back as {"questions": [...]}; the two
+            # writing sections have their own shape and are handled above.
+            if "questions" in piece:
+                merged.setdefault("questions", []).extend(piece.get("questions") or [])
+            else:
+                merged.update(piece)
 
     if numbers:
         got = {str(q.get("number")) for q in merged.get("questions", []) if isinstance(q, dict)}
@@ -4741,12 +5157,22 @@ def run_repair_answers(args: argparse.Namespace) -> None:
     updated_count = 0
     no_answer_docs: list[str] = []
 
+    # A paper whose answers came as their own document has nothing to scan in its own
+    # text — the answers are in the file it was paired with.
+    pairing_path = out_dir / "answer_pairing.json"
+    pairing = read_json(pairing_path) if pairing_path.exists() else {}
+    if not isinstance(pairing, dict):
+        pairing = {}
+
     for source_doc, rows in sorted(by_doc.items()):
-        stem = safe_stem(source_doc)
+        answers_doc = pairing.get(source_doc) or source_doc
+        stem = safe_stem(answers_doc)
         text_path = extracted_dir / f"{stem}.txt"
         if not text_path.exists():
             log(args, f"  skip {source_doc}: extracted text not found at {text_path}")
             continue
+        if answers_doc != source_doc:
+            log(args, f"  {source_doc}: 答案取自配对的「{answers_doc}」")
 
         text = text_path.read_text(encoding="utf-8")
         full_answers = extract_all_answers_from_full_text(text)
@@ -4829,6 +5255,57 @@ def run_repair_answers(args: argparse.Namespace) -> None:
     run_assemble(args)
 
 
+def precheck_ask_model(args: argparse.Namespace, name: str, text: str) -> dict:
+    """Ask the fast model whether a suspect paper is a coherent English exam paper.
+
+    Only ever called for papers the local checks already flagged, so the spend is bounded
+    to the handful that look broken. Runs on the FLASH role with thinking off; the call is
+    recorded in the usage ledger like any other.
+    """
+    provider = pv.get(getattr(args, "provider", pv.DEFAULT_PROVIDER))
+    model = provider.role_model(pv.FLASH)
+    sample = (text or "").strip()[:3000]
+    prompt = (
+        "下面是从一个文件里抽取出来的文本，本应是一份高中英语试卷。"
+        "请判断它是不是内容连贯、可用的英语试卷，还是抽取/OCR 出了乱码、残缺或错乱。"
+        '只输出 JSON：{"ok": true 或 false, "reason": "一句话"}，JSON 的语法符号用英文半角引号。\n\n'
+        f"----\n{sample}\n----"
+    )
+    result = call_stage_model(
+        args, prompt, model=model,
+        reasoning_effort=getattr(args, "segment_reasoning_effort", "high"),
+        thinking="disabled", max_tokens=200, stage="precheck", item_id=name,
+    )
+    parsed = parse_model_json(result.content)
+    if isinstance(parsed, dict):
+        return parsed
+    return {"ok": None, "reason": (result.content or "").strip()[:200]}
+
+
+def precheck_findings(args: argparse.Namespace, suspects: list[tuple[str, str, dict]]) -> list[str]:
+    """Turn local-suspect papers into human lines for the summary, escalating each to the
+    fast model when escalation is on and an API key is available. Warn-only; never aborts."""
+    escalate = getattr(args, "precheck_escalate", True)
+    api_key = (args.api_key or os.environ.get(args.api_key_env)) if escalate else None
+    lines: list[str] = []
+    for name, text, result in suspects:
+        line = f"{name}：{'；'.join(result['reasons'])}"
+        if escalate and api_key:
+            verdict = precheck_ask_model(args, name, text)
+            ok = verdict.get("ok")
+            reason = str(verdict.get("reason") or "").strip()
+            if ok is False:
+                line += f" ／ flash 复核：判为坏（{reason}）"
+            elif ok is True:
+                line += f" ／ flash 复核：看着还能用（{reason}）"
+            else:
+                line += f" ／ flash 复核未给明确结论（{reason}）"
+        elif escalate and not api_key:
+            line += " ／ 未设 API key，已跳过 flash 复核"
+        lines.append(line)
+    return lines
+
+
 def run_preflight(args: argparse.Namespace) -> None:
     input_path = Path(args.input)
     out_dir = Path(args.out)
@@ -4840,12 +5317,16 @@ def run_preflight(args: argparse.Namespace) -> None:
     local_segment_count = 0
     local_segment_chars = 0
     low_confidence_docs: list[str] = []
+    suspect_docs: list[tuple[str, str, dict]] = []
     total_tokens = 0
     local_segment_tokens = 0
     for docx in docx_files:
         text = extract_docx_text(docx)
         total_chars += len(text)
         total_tokens += count_tokens(text)
+        pc = input_precheck.precheck_text(text)
+        if pc["suspect"]:
+            suspect_docs.append((docx.name, text, pc))
         if args.segment_input == "local":
             segments = local_segment_paper(docx.name, text)
             local_segment_count += len(segments)
@@ -4881,6 +5362,12 @@ def run_preflight(args: argparse.Namespace) -> None:
         log(args, "  local segmentation warning:")
         for item in low_confidence_docs:
             log(args, f"    - {item}")
+    if suspect_docs:
+        log(args, f"  ⚠️ 输入预检发现 {len(suspect_docs)} 份卷子可疑（仅警告，不影响流程）：")
+        for line in precheck_findings(args, suspect_docs):
+            log(args, f"    - {line}")
+    else:
+        log(args, "  输入预检：全部通过。")
 
 
 def run_quality_report(args: argparse.Namespace) -> None:
@@ -5395,6 +5882,24 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=True,
         help="When local segmentation has structural WARN/FAIL, re-segment only affected papers with rough model chunks.",
     )
+    parser.add_argument(
+        "--precheck-escalate",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="In preflight, escalate a locally-suspect paper (mojibake/near-empty) to the fast model for a coherence check. Warn-only, never blocks.",
+    )
+    parser.add_argument(
+        "--answer-pairing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Recognise a separate 答案 document and match it to its paper, instead of segmenting it as if it were one.",
+    )
+    parser.add_argument(
+        "--pairing-confirm",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Have the fast model confirm each proposed paper↔answers pairing. Off means trust the filenames alone.",
+    )
     parser.add_argument("--answer-tail-chars", type=int, default=8000, help="Characters of the final answer area appended to rough segment chunks.")
     parser.add_argument("--review-candidates", type=int, default=6, help="Local shortlist size per section before pro review.")
     # No `choices=` on any effort flag: argparse fixes its choices at parse time, but
@@ -5494,6 +5999,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--preview-chars", type=int, default=1200, help="Characters shown for preview output.")
     parser.add_argument("--quiet", action="store_true", help="Only print hard errors.")
     parser.add_argument("--save-conversations", action=argparse.BooleanOptionalAction, default=True, help="Save prompt/response markdown files for API calls.")
+    parser.add_argument("--notify", action="store_true", help="Post a macOS notification when the run finishes (success or failure). For background/scripted runs.")
     parser.add_argument("--review-select", action="store_true", help="In --mode stage1, run pro review-select after local select.")
     parser.add_argument(
         "--reselect",
@@ -5588,6 +6094,18 @@ def main(argv: list[str]) -> int:
         if args.init_only:
             log(args, "Initialization finished; exiting because --init-only was used.")
             return 0
+    try:
+        dispatch_mode(args)
+    except BaseException as exc:  # noqa: BLE001 — notify on any exit, then re-raise unchanged
+        if getattr(args, "notify", False):
+            notify_mod.notify("AI英语试卷整理工具", f"运行失败：{type(exc).__name__}: {exc}", success=False)
+        raise
+    if getattr(args, "notify", False):
+        notify_mod.notify("AI英语试卷整理工具", f"整理完成（{args.mode}）：{Path(args.out)}", success=True)
+    return 0
+
+
+def dispatch_mode(args: argparse.Namespace) -> None:
     if args.mode == "prompts":
         items = run_extract_and_prompt(args)
         log(args, f"Pipeline finished successfully: found {len(items)} candidate item(s).")
@@ -5650,7 +6168,6 @@ def main(argv: list[str]) -> int:
     elif args.mode == "stage1":
         run_stage1(args)
         log(args, f"Pipeline finished successfully: completed stage1 under {Path(args.out)}")
-    return 0
 
 
 if __name__ == "__main__":

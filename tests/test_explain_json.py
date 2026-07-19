@@ -7,13 +7,14 @@ the first real run.
 
 Repairing the string in the parser would be a silent degradation (the essay would
 come back subtly mangled), and hard-failing wastes the rest of the paper. So the
-model gets exactly one corrective turn, and only then do we give up.
+model gets a couple of corrective turns, and only then do we give up.
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -71,20 +72,39 @@ def test_an_unescaped_quote_is_handed_back_to_the_model_once():
     assert len(usages) == 2, "both turns are billed, so both must be counted"
 
 
+def test_recovers_within_a_couple_of_corrective_turns():
+    # One repair turn was not enough for the big nested 读后续写 JSON: the model rendered
+    # its braces in Chinese quotes, the single retry said "don't" and it did it again, and
+    # the whole paper failed. A second nudge — one that echoes the model's own opening back
+    # at it — recovers the item.
+    conversation = FakeConversation([BROKEN, BROKEN, FIXED])
+    parsed, _, usages = pipeline.ask_for_json(
+        conversation, _args(), "讲这道题",
+        model="deepseek-v4-flash", reasoning_effort="medium",
+        thinking="enabled", max_tokens=16000,
+    )
+    assert isinstance(parsed, dict), "a second corrective turn recovered the item"
+    assert len(conversation.asked) == 3
+    assert "上一条的开头是" in conversation.asked[2], "the later retry echoes the model's own mistake"
+    assert len(usages) == 3, "every billed turn is counted"
+
+
 def test_a_reply_that_is_still_broken_is_a_hard_error():
-    conversation = FakeConversation([BROKEN, BROKEN])
+    replies = [BROKEN] * (pipeline.JSON_REPAIR_MAX_TURNS + 1)
+    conversation = FakeConversation(replies)
     parsed, result, _ = pipeline.ask_for_json(
         conversation, _args(), "讲这道题",
         model="deepseek-v4-flash", reasoning_effort="medium",
         thinking="enabled", max_tokens=16000,
     )
     assert not isinstance(parsed, dict)
+    assert len(conversation.asked) == pipeline.JSON_REPAIR_MAX_TURNS + 1, "all retries used"
     try:
         pipeline.require_parsed(parsed, result, 16000, "explain", "item")
     except RuntimeError as exc:
         assert "不是合法 JSON" in str(exc)
     else:
-        raise AssertionError("a twice-broken reply must stop the run, not degrade")
+        raise AssertionError("a still-broken reply must stop the run, not degrade")
 
 
 def test_the_essay_word_count_excludes_the_greeting_and_sign_off():
@@ -138,3 +158,68 @@ def test_a_truncated_reply_is_not_retried():
     )
     assert not isinstance(parsed, dict)
     assert len(conversation.asked) == 1, "truncation is not a punctuation slip"
+
+
+# --- the writing split: one giant nested JSON became a brief plus one small idea per turn.
+
+BRIEF = '{"审题": {"原文情境": "母亲盯着成绩"}, "评分要点": "先看两段是否接住首句"}'
+ONE_IDEA = (
+    '{"角度": "母亲的认知转变", "提纲": ["第一段：电话", "第二段：拥抱"], '
+    '"范文": "Not long after, the phone rang.\\n\\nThat afternoon, she came home.", '
+    '"词数": 168, "亮点": {"高级词汇": ["moistened"], "黄金句型": ["Heart pounding, she paused.（独立主格）"]}}'
+)
+
+
+def _writing_args() -> argparse.Namespace:
+    return argparse.Namespace(
+        explain_model="deepseek-v4-flash",
+        explain_reasoning_effort="high",
+        explain_thinking="enabled",
+        explain_max_tokens=16000,
+        provider="deepseek",
+        preset="quality",
+        save_conversations=False,
+    )
+
+
+def test_writing_is_asked_in_small_pieces_and_merges_to_the_expected_shape():
+    # The brief is one small turn; each idea is another. Never the 2–3-essay monolith that
+    # broke its own JSON. The merged result must be exactly the shape render_explanation
+    # already renders, so the exporter needs no change.
+    replies = [BRIEF] + [ONE_IDEA] * pipeline.WRITING_IDEA_COUNT
+    conversation = FakeConversation(replies)
+    segment = {"question_text": "A story with two opening sentences.",
+               "item_id": "p1__continuation_writing__01", "answer_key": ""}
+    with tempfile.TemporaryDirectory() as tmp:
+        merged, usages, clients = pipeline.explain_writing(
+            conversation, _writing_args(), Path(tmp), segment,
+            "continuation_writing", "官方参考范文……", "p1__continuation_writing__01",
+        )
+    assert len(conversation.asked) == 1 + pipeline.WRITING_IDEA_COUNT, "brief + one turn per idea"
+    assert set(merged) >= {"审题", "思路", "评分要点"}
+    assert len(merged["思路"]) == pipeline.WRITING_IDEA_COUNT
+    # The exact contract with the exporter: this dict renders without a KeyError.
+    rendered = pipeline.render_explanation(merged)
+    assert "审题" in rendered and "思路 1" in rendered and "评分要点" in rendered
+    assert len(usages) == 1 + pipeline.WRITING_IDEA_COUNT
+
+
+def test_a_broken_writing_idea_leaves_the_whole_reply_on_disk():
+    # 200 chars in the error message is not enough to debug a broken essay JSON. On a hard
+    # failure the entire reply and the prompt are kept under <out>/failures/ for a post-mortem.
+    long_broken = BROKEN * 50
+    result = pipeline.ChatResult(
+        content=long_broken, usage={"completion_tokens": 100}, client_used="http",
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp)
+        path = pipeline.dump_failure(
+            out, "explain", "p1__continuation_writing__01", "THE-PROMPT-WE-SENT",
+            result, RuntimeError("不是合法 JSON"),
+            provider="deepseek", model="deepseek-v4-pro", preset="quality",
+        )
+        assert path.exists() and path.parent.name == "failures"
+        saved = path.read_text(encoding="utf-8")
+    assert "THE-PROMPT-WE-SENT" in saved
+    assert "不是合法 JSON" in saved
+    assert long_broken in saved, "the full reply is kept, not the 200-char preview"

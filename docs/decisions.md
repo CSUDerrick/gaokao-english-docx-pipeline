@@ -1,5 +1,56 @@
 # Architecture Decisions
 
+- **决策 36: 所有导出统一一套「印刷体」——小四 + Times New Roman/宋体 + 单倍行距 + 关网格**
+  - *原因*: 题目原文是从十几份不同的卷子克隆来的（决策 11：保排版），每份自带一套字体、字号、
+    行距。合并出来的学生版/教师版因此**一篇一个样**，老师要的是**整份读起来一致**。
+  - *做法*: `docx_splice.normalize_format()` 在**合并之后**走一遍整个正文（含表格单元格，`iter`
+    会钻进 `w:tbl`）：每个段落 → `snapToGrid=0`、`spacing before=0 after=0 line=240 auto`（单倍）、
+    **不发** `contextualSpacing`（「相同样式段落间不加空格」那个勾去掉）；每个 run → 英文
+    `Times New Roman`、中文 `宋体`、字号**小四**（24 半点）。**加粗/斜体/下划线（填空线）/缩进/
+    对齐照留**——那是题目的结构，不是版式。学生版、教师版、答案汇总版都走这一遍。
+  - *顺序*: `merge → normalize_format → scrub_metadata → validate`。normalize 用 python-docx 落盘，
+    必须在 `scrub_metadata`（直接改 zip 里的 docProps）**之前**，否则作者名又被写回去。
+  - *字号可调但默认小四*: `half_points` 参数留着（五号=21），本次老师明确要**全部小四**。
+  - *护栏*: `test_normalize_format_pins_house_style_but_keeps_emphasis_and_media`、
+    `test_every_exported_file_shares_one_house_style`。
+
+- **决策 35: 阅读段「缺题」要检测、跳过、换一份——绝不静默印出一段没有题目的阅读**
+  - *原因*: 有一份**华南师范**的卷子，原始 docx 里**阅读B的 24-27 题根本不存在**——被阅读C的题目
+    （28-31）**重复占位**挤没了（原卷作者的复制粘贴事故）。工具照单全收，学生版/教师版里
+    「第 N 篇 阅读B」**只有文章、没有题**，而且**没有任何警告**。代码没法凭空生成缺失的题，
+    但能**拒绝假装它们在那儿**。
+  - *识别*: `segment_quality.missing_question_numbers()`——阅读段的题目都是「24. …」这样的**编号题干**，
+    拿 `answer_key` 里的每个题号去正文里找 `^N.` 的题干行，找不到就是原卷丢了这道题。
+    **只管阅读段**：完形/语法填空是把**空**编号内嵌在正文里（`____41____`），不是题干，去那儿数会误报。
+  - *跳过 + 换一份*: `run_select` / `run_review_select` 在候选阶段就 `drop_incomplete_reading` 把缺题的卷子
+    **踢出选题池**（本地打分是确定性的，不踢就每轮都选中同一份坏的）——完整的那份（安徽鼎尖）自动补位。
+    导出侧 `export_selected` 还有一道**兜底闸门**：真漏进来了就**跳过并大声警告**（决策立场同「宁可停下
+    也不能发出去」），并提示去跑 `--mode review-select --reselect`。
+  - *不清空题型*: 万一某题型的候选**全部**缺题，则**不过滤**（留给导出闸门喊），免得直接产出空题型。
+  - *护栏*: `test_missing_question_numbers_flags_a_dropped_reading_passage`、
+    `test_a_reading_passage_missing_its_questions_is_skipped_not_shipped`。
+
+- **决策 34: 一张卷子的答案可以在**另一份文档**里——解析块因此要能跨文件指**
+  - *原因*: 老师手上常是「学生版试卷（只有题）+ 答案文档（只有答案和详解）」两份。
+    而整个代码库是按「一份 docx = 一张完整卷子」建的：`source_doc = docx.name`、
+    每份 docx 独立并行切分、`OfficialExplanations(doc, offset)` 只吃一个 doc。
+    后果是**丢一份答案文档进去，切出 0 个 segment → FAIL → 整轮 SystemExit**。
+  - *做法*: segment 新增 `official_explanation_path`——**题目块仍只从原卷克隆**（决策没变），
+    但解析块的下标可以指向配对的答案文档。**留空 = 和题目同一个文件**，盘上的老 segment 无缝兼容。
+    导出侧 `clone_subset(Path(official_src), …)` 用同一个字段。
+  - *识别答案文档，靠的是「答案键在哪」，不是「有没有题」*: 实测一份真答案文档，
+    切分器会把它的**参考范文**当成 2 道写作题，而 `_find_answer_section_start` 会把答案区
+    定位到 **听力录音稿**（因为顶上的答案键没有标题行）——**两个信号都在撒谎**。
+    唯一可靠的是：**没有哪张卷子会拿答案键开头**（实测答案文档 29/13015 = 0.3%，卷子 63%）。
+  - *答案文档整篇就是答案区，必须整份取*: 对它再跑一遍尾部检测会切在「听力录音稿」，
+    而**参考范文在它上面**——范文全被扔掉，两个写作题的答案直接变空。
+    护栏：`test_a_paired_answers_document_is_taken_whole_not_cut_at_its_first_header`。
+  - *不确定就不配*: 文件名只负责**提名**，由 flash 复核拍板；模型说不是/说不准 → **不配对**，
+    该卷按「原卷未提供答案」走并警告。配错（A 卷印 B 卷答案）比没答案严重得多，
+    这和「越界一律返回空，宁可不印也不能印错」是同一个立场。
+  - *验收*: 把一份自带答案的真卷子按答案区劈成两份，再喂进去——**9 个题型的 answer_key
+    和 answer_source 与劈之前逐项一致**（含两篇范文）。
+
 - **决策 1: 试卷切分采用“本地优先 + 结构异常模型回退”**
   - *原因*: 正常固定结构试卷无需 API；共享质量门发现结构性 WARN/FAIL 时，仅重切异常试卷可兼顾成本与可靠性。PASS* 尾部粘连不触发回退。
 - **决策 2: GUI 架构重构，解耦 API 依赖**

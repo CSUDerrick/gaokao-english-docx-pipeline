@@ -11,6 +11,11 @@ build/
 dist/
 *.spec
 
+# Which VERSION this machine last packaged, so build_macos.sh can refuse to build the
+# same number twice. Local build state — committing it would make one machine's last
+# build block everyone else's first one.
+packaging/.last_built_version
+
 # The app's own saved preferences: local runtime state (input/output folders, the
 # models last chosen). Committing it would push one machine's paths onto everyone else,
 # and a stale copy in the repo would fight the schema migration in app/settings.py.

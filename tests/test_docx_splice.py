@@ -460,6 +460,76 @@ def _docprops(path: Path) -> str:
         )
 
 
+def _a4(path: Path) -> Path:
+    from docx.shared import Cm
+
+    doc = Document(str(path))
+    for section in doc.sections:
+        section.page_width, section.page_height = Cm(21.0), Cm(29.7)
+    doc.save(str(path))
+    return path
+
+
+def _sz_values(path: Path) -> set[str]:
+    with zipfile.ZipFile(path) as z:
+        dx = etree.fromstring(z.read("word/document.xml"))
+    return {e.get(W + "val") for e in dx.findall(".//" + W + "sz")}
+
+
+def test_normalize_format_pins_house_style_but_keeps_emphasis_and_media():
+    """统一格式：小四 + Times New Roman/宋体 + single spacing, no snap-to-grid.
+
+    The teacher asked for every exported file to read the same, but the questions are
+    clones of a dozen source papers each in its own font and size. normalize_format
+    forces the house style over the merged body while leaving the things that carry a
+    question's meaning — bold, italics, the underline that draws a fill-in blank, the
+    table and the image — untouched.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        src = _a4(_fixture(tmp / "a.docx"))
+        out = ds.clone_subset(src, list(range(len(db.read_docx(src).body_children))), tmp / "c.docx")
+
+        before = {tag: _count(out, tag) for tag in ("b", "u", "i", "tbl", "drawing")}
+        ds.normalize_format(out)
+
+        # emphasis, blanks, table and picture all survive
+        for tag, n in before.items():
+            assert _count(out, tag) == n, f"<w:{tag}> changed during normalize"
+        assert ds.media_count(out) == 1
+        ds.validate(out)  # still a well-formed A4 file
+
+        # every run is 小四 (24 half-points) and nothing else
+        assert _sz_values(out) == {"24"}, f"sizes are not uniformly 小四: {_sz_values(out)}"
+
+        with zipfile.ZipFile(out) as z:
+            dx = etree.fromstring(z.read("word/document.xml"))
+        body = dx.find(W + "body")
+        paras = body.findall(".//" + W + "p")
+        # snap-to-grid is off on every paragraph, and the "same-style spacing" box
+        # (contextualSpacing) is never emitted
+        assert dx.findall(".//" + W + "contextualSpacing") == []
+        for p in paras:
+            snap = p.find(W + "pPr/" + W + "snapToGrid")
+            assert snap is not None and snap.get(W + "val") == "0"
+            spacing = p.find(W + "pPr/" + W + "spacing")
+            assert spacing.get(W + "before") == "0" and spacing.get(W + "after") == "0"
+            assert spacing.get(W + "line") == "240" and spacing.get(W + "lineRule") == "auto"
+        # English in Times New Roman, 中文 in 宋体
+        for fonts in dx.findall(".//" + W + "r/" + W + "rPr/" + W + "rFonts"):
+            assert fonts.get(W + "ascii") == "Times New Roman"
+            assert fonts.get(W + "eastAsia") == "宋体"
+
+
+def test_normalize_format_size_is_configurable():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        src = _a4(_fixture(tmp / "a.docx"))
+        out = ds.clone_subset(src, list(range(len(db.read_docx(src).body_children))), tmp / "c.docx")
+        ds.normalize_format(out, half_points=21)  # 五号 = 10.5pt
+        assert _sz_values(out) == {"21"}
+
+
 def test_scrub_metadata_removes_original_author_after_merge():
     # Must be asserted on a MERGED file, not just a clone: python-docx's
     # core_properties setter does not reach the core.xml that docxcompose

@@ -21,7 +21,7 @@ from pathlib import Path
 import docx_blocks as db
 import docx_splice as ds
 from bundle_paths import template_dir
-from segment_quality import answer_leaks
+from segment_quality import answer_leaks, missing_question_numbers
 
 STUDENT = "高三英语精选试题_学生版.docx"
 TEACHER = "高三英语精选试题_教师讲解版.docx"
@@ -147,6 +147,30 @@ def export_selected(out_dir: Path, pipeline, log=print) -> list[Path]:
         key=lambda r: (pipeline.section_order(r.get("section", "")), r.get("source_doc", ""), r.get("item_id", "")),
     )
 
+    # A reading passage whose questions the source paper never contained (决策 35: one
+    # 华南师范 卷 duplicated 阅读C 的题目，把阅读B的题挤没了) cannot be cloned into
+    # anything usable — the stems simply are not in the file. Skip it with a loud
+    # warning rather than ship a passage with no questions; the fix is to re-select a
+    # complete paper (--mode review-select drops it there so this rarely fires).
+    incomplete: list[tuple[dict, list[str]]] = []
+    kept: list[dict] = []
+    for row in rows:
+        seg_path = row.get("segment_path")
+        segment = _load(Path(seg_path)) if seg_path and Path(seg_path).exists() else {}
+        missing = missing_question_numbers(segment)
+        (incomplete.append((row, missing)) if missing else kept.append(row))
+    for row, missing in incomplete:
+        label = row.get("display_section") or pipeline.section_display(row.get("section", ""))
+        log(
+            f"  跳过「{label}·{row.get('item_label', '')}」（来源：{row.get('source_doc', '')}）："
+            f"原卷缺第 {', '.join(missing)} 题，未纳入导出。"
+        )
+    if incomplete:
+        log("  → 建议跑 --mode review-select --reselect，让工具换一份题目完整的卷子补上。")
+    rows = kept
+    if not rows:
+        raise SystemExit("所有选中的题都因原卷缺题被跳过；请补充完整的试卷后重跑选题。")
+
     docx_dir = out_dir / "docx_exports"
     docx_dir.mkdir(parents=True, exist_ok=True)
 
@@ -177,6 +201,10 @@ def export_selected(out_dir: Path, pipeline, log=print) -> list[Path]:
             # clones of the original OOXML; only the third is generated text.
             notes = _ai_notes(row, pipeline)
             official = segment.get("official_explanation_blocks") or []
+            # The answers can live in their own document (a student edition plus a
+            # separate 答案 file), in which case the explanation blocks index into that
+            # file rather than the paper. Empty means "same file as the questions".
+            official_src = segment.get("official_explanation_path") or src
 
             if not cloneable:
                 # No pointer back into an original docx (AI-segmented text the
@@ -212,11 +240,12 @@ def export_selected(out_dir: Path, pipeline, log=print) -> list[Path]:
             ds.decorate(tp, heading=teacher_heading)
             teacher_parts.append(tp)
 
-            if len(official) == 2:
+            if len(official) == 2 and official_src and Path(official_src).exists():
                 # Clone the paper's own 【N题详解】 paragraphs, with their original
-                # typesetting, the same way the question itself is cloned.
+                # typesetting, the same way the question itself is cloned — from the
+                # answers document when that is where they live.
                 ep = tmp / f"t{n:03d}x.docx"
-                ds.clone_subset(Path(src), list(range(official[0], official[1])), ep)
+                ds.clone_subset(Path(official_src), list(range(official[0], official[1])), ep)
                 ds.decorate(ep, heading=OFFICIAL_HEADING, notes=notes)
             else:
                 # The paper never explained this one (广东 skips four whole
@@ -241,11 +270,17 @@ def export_selected(out_dir: Path, pipeline, log=print) -> list[Path]:
         ):
             target = docx_dir / name
             ds.merge(parts, target)
+            # One house style over the merged clones: 小四, Times New Roman + 宋体,
+            # single spacing, no snap-to-grid. Must run *before* scrub_metadata, which
+            # rewrites the zip directly, and before validate() so it checks the file
+            # the teacher actually opens.
+            ds.normalize_format(target)
             ds.scrub_metadata(target, title)
             created.append(target)
             log(f"  wrote {target.name}  (images: {ds.media_count(target)})")
 
     answers = _answers_doc(rows, docx_dir / ANSWERS, pipeline)
+    ds.normalize_format(answers)
     ds.scrub_metadata(answers, "高三英语答案汇总")
     log(f"  wrote {answers.name}")
     created.append(answers)

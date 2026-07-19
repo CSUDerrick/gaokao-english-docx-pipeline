@@ -54,8 +54,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-APP_NAME = "英语试卷整理工具"
-VERSION = "0.8.0"
+APP_NAME = "AI英语试卷整理工具"
+VERSION = "0.10.1"
 REPO = "CSUDerrick/gaokao-english-docx-pipeline"
 
 # The tool outgrew 高三 — the same pipeline handles junior-high papers — so the app and
@@ -311,7 +311,9 @@ class KeysDialog(QDialog):
         self.paddle_token.setEchoMode(QLineEdit.Password)
         self.paddle_token.setPlaceholderText("只有要处理 PDF 试卷时才需要")
         self.paddle_url = QLineEdit(keychain_get("PADDLEOCR_BASE_URL"))
-        self.paddle_url.setPlaceholderText("服务地址（aistudio.baidu.com/paddleocr/task 查看）")
+        # Optional now: the job API is one global address, so leaving this empty is the
+        # normal case. It stays only as an override for a private deployment.
+        self.paddle_url.setPlaceholderText("留空即可（默认 paddleocr.aistudio-app.com）")
         self.paddle_test = QPushButton("测试")
         self.paddle_test.clicked.connect(self.test_paddle)
         self.paddle_token_row = self._row("PaddleOCR 令牌", self.paddle_token)
@@ -463,9 +465,10 @@ class KeysDialog(QDialog):
         self._run_check(self.refresh, check)
 
     def test_paddle(self) -> None:
+        # The address is optional: empty means the default global endpoint.
         token, url = self.paddle_token.text().strip(), self.paddle_url.text().strip()
-        if not (token and url):
-            self.status.setText("❌ PaddleOCR 需要同时填令牌和地址（只有处理 PDF 才用得上）")
+        if not token:
+            self.status.setText("❌ 先填 PaddleOCR 令牌（只有处理 PDF 才用得上）")
             return
 
         def check() -> tuple[bool, str]:
@@ -933,7 +936,17 @@ class Window(QMainWindow):
         self.progress = QProgressBar()
         self.progress.setTextVisible(True)
         self.progress.setFormat("就绪")
-        root.addWidget(self.progress)
+        # The time estimate lives *beside* the bar, not on top of it: the bar's own text
+        # sits over the moving fill and is easy to lose, and someone watching a long run
+        # wants the "how much longer" where it stays put and refreshes every second.
+        self.eta = QLabel("")
+        self.eta.setStyleSheet("color:#5570a0")
+        self.eta.setMinimumWidth(220)
+        self.eta.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        progress_row = QHBoxLayout()
+        progress_row.addWidget(self.progress, 1)
+        progress_row.addWidget(self.eta)
+        root.addLayout(progress_row)
 
         self.cost = QLabel("")
         self.cost.setStyleSheet("color:#5570a0")
@@ -1609,10 +1622,10 @@ class Window(QMainWindow):
             if self.cfg.pdf_backend == "mineru" and not keys["MINERU_TOKEN"]:
                 QMessageBox.warning(self, "缺少 MinerU 令牌", "文件夹里有 PDF，需要在「API 设置…」里填写 MinerU 令牌。")
                 return
-            if self.cfg.pdf_backend == "paddle" and not (
-                keys["PADDLEOCR_ACCESS_TOKEN"] and keys["PADDLEOCR_BASE_URL"]
-            ):
-                QMessageBox.warning(self, "缺少 PaddleOCR 配置", "文件夹里有 PDF，需要在「API 设置…」里填写 PaddleOCR 令牌和服务地址。")
+            # Only the token: PaddleOCR's job API is one global endpoint now, so the
+            # service address is optional and defaults itself.
+            if self.cfg.pdf_backend == "paddle" and not keys["PADDLEOCR_ACCESS_TOKEN"]:
+                QMessageBox.warning(self, "缺少 PaddleOCR 令牌", "文件夹里有 PDF，需要在「API 设置…」里填写 PaddleOCR 令牌。")
                 return
 
         cfg = self._collect()
@@ -1634,6 +1647,7 @@ class Window(QMainWindow):
         self.plan = []
         self.stage_index = 0
         self.stage_fraction = 0.0
+        self.eta.setText("预计耗时计算中…")
         self.ticker.start(1000)  # the user asked for a 1-second heartbeat
         self.thread.start()
 
@@ -1697,10 +1711,29 @@ class Window(QMainWindow):
         elapsed = time.time() - self.started_at
         self.progress.setMaximum(1000)
         self.progress.setValue(int(fraction * 1000))
-        self.progress.setFormat(
-            f"{label} · {fraction * 100:.0f}% · 已用 {format_duration(elapsed)}"
-            f" · 预计剩余 {format_duration(remaining)}"
+        self.progress.setFormat(f"{label} · {fraction * 100:.0f}%")
+        self.eta.setText(
+            f"预计剩余 {format_duration(remaining)} · 已用 {format_duration(elapsed)}"
         )
+
+    def _maybe_notify(self, ok: bool, message: str) -> None:
+        """A macOS notification when the run ends while the app is in the background.
+
+        The teacher kicks off a long run and switches to something else; the modal dialog
+        below then sits unseen behind other windows. Only fire when we are NOT the active
+        app — in the foreground the dialog is enough and a banner would just be noise.
+        """
+        app = QApplication.instance()
+        if app is not None and app.applicationState() == Qt.ApplicationActive:
+            return
+        try:
+            import notify
+        except Exception:
+            return
+        if ok:
+            notify.notify(APP_NAME, f"整理完成，Word 文件已生成：{message}", success=True)
+        else:
+            notify.notify(APP_NAME, f"运行失败：{message}", success=False)
 
     def on_done(self, ok: bool, message: str) -> None:
         self.ticker.stop()
@@ -1709,16 +1742,17 @@ class Window(QMainWindow):
             self.thread.quit()
             self.thread.wait()
         self._show_cost()
+        self._maybe_notify(ok, message)
         if ok:
-            self.progress.setFormat(
-                f"完成 · 用时 {format_duration(time.time() - (self.started_at or time.time()))}"
-            )
+            self.progress.setFormat("完成")
             self.progress.setValue(self.progress.maximum())
+            self.eta.setText(f"用时 {format_duration(time.time() - (self.started_at or time.time()))}")
             self.log.appendPlainText(f"\n✅ 全部完成，Word 文件在：{message}")
             if QMessageBox.question(self, "完成", "整理完成，现在打开结果文件夹？") == QMessageBox.Yes:
                 self._open(self.output_dir / "docx_exports")
         else:
             self.progress.setFormat("失败")
+            self.eta.setText("")
             self.log.appendPlainText(f"\n❌ {message}")
             QMessageBox.critical(self, "出错了", message)
 

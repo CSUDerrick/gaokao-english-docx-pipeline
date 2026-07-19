@@ -179,6 +179,108 @@ def test_a_paper_that_never_explained_the_question_says_so_and_still_prints_the_
         assert ex.AI_HEADING in text, "our explanation is written either way"
 
 
+def _body_sz_values(path: Path) -> set[str]:
+    import zipfile
+
+    from lxml import etree
+
+    w = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    with zipfile.ZipFile(path) as z:
+        dx = etree.fromstring(z.read("word/document.xml"))
+    return {e.get(w + "val") for e in dx.findall(".//" + w + "sz")}
+
+
+def test_every_exported_file_shares_one_house_style():
+    """统一格式：the student, teacher and answer files all come out 小四, TNR + 宋体,
+    single-spaced, snap-to-grid off — regardless of what font the source paper used."""
+    import zipfile
+
+    from lxml import etree
+
+    w = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    with tempfile.TemporaryDirectory() as tmp:
+        out = _run_dir(Path(tmp))
+        ex.export_selected(out, pipeline, log=lambda *_: None)
+
+        for name in (ex.STUDENT, ex.TEACHER, ex.ANSWERS):
+            path = out / "docx_exports" / name
+            assert _body_sz_values(path) == {"24"}, f"{name} 不是统一小四: {_body_sz_values(path)}"
+            with zipfile.ZipFile(path) as z:
+                dx = etree.fromstring(z.read("word/document.xml"))
+            assert dx.findall(".//" + w + "contextualSpacing") == [], f"{name} 仍勾了「相同样式不加空格」"
+            for p in dx.findall(".//" + w + "p"):
+                snap = p.find(w + "pPr/" + w + "snapToGrid")
+                assert snap is not None and snap.get(w + "val") == "0", f"{name} 有段落仍对齐网格"
+
+
+def test_missing_question_numbers_flags_a_dropped_reading_passage():
+    import segment_quality as sq
+
+    complete = {
+        "section": "reading_b",
+        "question_text": "B\nA passage.\n24. Q?\nA. x B. y\n25. Q?\nA. x B. y",
+        "answer_key": [{"number": "24"}, {"number": "25"}],
+    }
+    dropped = {
+        "section": "reading_b",
+        "question_text": "B\nA passage with no questions at all.",
+        "answer_key": [{"number": "24"}, {"number": "25"}, {"number": "26"}, {"number": "27"}],
+    }
+    cloze = {  # 完形 numbers blanks inline, not as "N." stems — must not cry wolf
+        "section": "cloze",
+        "question_text": "A passage with ____41____ and ____42____ blanks.",
+        "answer_key": [{"number": "41"}, {"number": "42"}],
+    }
+    assert sq.missing_question_numbers(complete) == []
+    assert sq.missing_question_numbers(dropped) == ["24", "25", "26", "27"]
+    assert sq.missing_question_numbers(cloze) == []
+
+
+def test_a_reading_passage_missing_its_questions_is_skipped_not_shipped():
+    """One 华南师范 卷 had passage B's questions overwritten by passage C's (决策 35).
+
+    The stems are simply not in the source, so the passage cannot be exported into
+    anything a student can answer. It must be dropped with a warning rather than
+    shipped as a passage with no questions — and the complete questions stay."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        out = _run_dir(tmp)
+
+        broken = {
+            "item_id": "缺题卷__reading_c__01",
+            "source_doc": "缺题卷2026届高三英语试题.docx",
+            "section": "reading_c",
+            "display_section": "阅读C",
+            "item_label": "阅读C",
+            "question_text": "C\nDEFECTIVE_PASSAGE_MARKER a passage whose questions the paper dropped.",
+            "answer_key": [{"number": "28"}, {"number": "29"}, {"number": "30"}, {"number": "31"}],
+            "source_path": "",
+            "source_blocks": None,
+        }
+        broken_path = out / "segments" / "broken.json"
+        broken_path.write_text(json.dumps(broken, ensure_ascii=False), encoding="utf-8")
+
+        rows = json.loads((out / "selected_items.json").read_text(encoding="utf-8"))
+        rows.append({
+            "item_id": "缺题卷__reading_c__01",
+            "source_doc": "缺题卷2026届高三英语试题.docx",
+            "section": "reading_c",
+            "display_section": "阅读C",
+            "item_label": "阅读C",
+            "segment_path": str(broken_path),
+        })
+        (out / "selected_items.json").write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
+
+        logs: list[str] = []
+        ex.export_selected(out, pipeline, log=logs.append)
+
+        for name in (ex.STUDENT, ex.TEACHER):
+            text = _text(out / "docx_exports" / name)
+            assert "DEFECTIVE_PASSAGE_MARKER" not in text, f"{name} 混入了缺题的阅读段"
+            assert "What inspired Cui to design" in text, f"{name} 丢了完整的题"
+        assert any("缺第" in line and "28" in line for line in logs), "缺题应有警告"
+
+
 def test_the_student_edition_is_untouched_by_any_of_this():
     with tempfile.TemporaryDirectory() as tmp:
         out = _run_dir(Path(tmp))
