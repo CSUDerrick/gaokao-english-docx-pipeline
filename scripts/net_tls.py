@@ -31,6 +31,11 @@ import ssl
 # Captured before any injection, so the insecure context can always be built from the
 # real standard library rather than from whatever replaced it.
 _STDLIB_CREATE_DEFAULT_CONTEXT = ssl.create_default_context
+# truststore replaces ssl.SSLContext itself, and its class verifies the *peer* — which a
+# server socket has none of. Anything that needs a genuine server-side context (the TLS
+# tests) has to build it from this, or it breaks as soon as anything in the process has
+# called install().
+STDLIB_SSL_CONTEXT = ssl.SSLContext
 
 SYSTEM = "system"    # macOS Keychain — sees corporate/AV roots
 CERTIFI = "certifi"  # Mozilla's bundle — does not

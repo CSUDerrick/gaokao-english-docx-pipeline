@@ -27,6 +27,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QFont, QGuiApplication, QIcon
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -39,6 +40,8 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QButtonGroup,
     QMessageBox,
@@ -55,7 +58,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "AI英语试卷整理工具"
-VERSION = "0.10.1"
+VERSION = "0.11.0"
 REPO = "CSUDerrick/gaokao-english-docx-pipeline"
 
 # The tool outgrew 高三 — the same pipeline handles junior-high papers — so the app and
@@ -421,16 +424,20 @@ class KeysDialog(QDialog):
         check = _Check(fn)
         check.moveToThread(thread)
         thread.started.connect(check.run)
-
-        def finished(ok: bool, message: str) -> None:
-            self.status.setText(f"✅ 可用（{message}）" if ok else f"❌ {message}")
-            button.setEnabled(True)
-            thread.quit()
-
-        check.finished.connect(finished)
+        # Bound method, not a closure: a functor with no receiver object is run in the
+        # thread that emitted the signal, so the widget updates below were happening on
+        # the worker thread. See MergeVocabDialog.merge for the same fix.
+        self._check_button = button
+        self._check_thread = thread
+        check.finished.connect(self._check_finished)
         thread.finished.connect(thread.deleteLater)
         self._check = check  # keep it alive until the thread finishes
         thread.start()
+
+    def _check_finished(self, ok: bool, message: str) -> None:
+        self.status.setText(f"✅ 可用（{message}）" if ok else f"❌ {message}")
+        self._check_button.setEnabled(True)
+        self._check_thread.quit()
 
     def test_api(self) -> None:
         provider, key = self.current_provider(), self.api_key.text().strip()
@@ -496,6 +503,239 @@ class KeysDialog(QDialog):
                 return False, str(exc).splitlines()[0][:160]
 
         self._run_check(self.mineru_test, check)
+
+
+class _DocxDropList(QListWidget):
+    """The handouts to merge. Drops are how they arrive — they sit in Finder, not here."""
+
+    changed = Signal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setAcceptDrops(True)
+        self.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.setMinimumHeight(150)
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event) -> None:  # noqa: N802
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event) -> None:  # noqa: N802
+        paths = [Path(u.toLocalFile()) for u in event.mimeData().urls()]
+        if paths:
+            self.add(paths)
+            event.acceptProposedAction()
+
+    def add(self, paths: list[Path]) -> int:
+        """Add files, expanding folders now rather than at merge time.
+
+        Expanding here is what makes the list an honest answer to 「会合并哪些文件」: a
+        folder shown as one line hides both how many handouts are in it and the ones that
+        are not handouts at all.
+        """
+        import merge_vocab_docx as mv
+
+        have = {str(p) for p in self.paths()}
+        added = 0
+        for path in mv.handouts_in(paths):
+            if str(path) in have:
+                continue
+            item = QListWidgetItem(path.name)
+            item.setData(Qt.UserRole, str(path))
+            item.setToolTip(str(path))
+            self.addItem(item)
+            have.add(str(path))
+            added += 1
+        if added:
+            self.changed.emit()
+        return added
+
+    def paths(self) -> list[Path]:
+        return [Path(self.item(i).data(Qt.UserRole)) for i in range(self.count())]
+
+    def remove_selected(self) -> None:
+        for item in self.selectedItems():
+            self.takeItem(self.row(item))
+        self.changed.emit()
+
+    def clear_all(self) -> None:
+        self.clear()
+        self.changed.emit()
+
+
+class MergeVocabDialog(QDialog):
+    """Merge several already-generated word lists into one, locally.
+
+    A term is a dozen runs and a dozen 重难点词汇表, and a student revising for the exam
+    wants one sheet with each word on it once. Doing it by hand across 2000 rows is where
+    the duplicates come from; doing it by re-running the pipeline would pay the model
+    again for words it has already chosen. So this reads the handouts on disk and calls no
+    API — it is free, and it works with no key configured at all.
+    """
+
+    def __init__(self, parent, default_out: Path, start_dir: Path) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("合并词汇表")
+        self.setMinimumWidth(660)
+        self._check: _Check | None = None
+        self._pending_out: Path | None = None
+        self._pending_thread: QThread | None = None
+        self._start_dir = start_dir
+        self.merged: Path | None = None
+
+        self.files = _DocxDropList()
+        self.files.changed.connect(self._refresh_count)
+
+        add_files = QPushButton("添加文件…")
+        add_files.clicked.connect(self.pick_files)
+        add_folder = QPushButton("添加文件夹…")
+        add_folder.clicked.connect(self.pick_folder)
+        drop = QPushButton("移除所选")
+        drop.clicked.connect(self.files.remove_selected)
+        clear = QPushButton("清空")
+        clear.clicked.connect(self.files.clear_all)
+        buttons = QHBoxLayout()
+        for button in (add_files, add_folder, drop, clear):
+            buttons.addWidget(button)
+        buttons.addStretch(1)
+
+        self.out_field = QLineEdit(str(default_out))
+        pick_out = QPushButton("选择…")
+        pick_out.clicked.connect(self.pick_out)
+
+        self.count_label = QLabel("")
+        self.count_label.setStyleSheet("color:#5570a0")
+
+        self.report = QPlainTextEdit()
+        self.report.setReadOnly(True)
+        self.report.setFont(QFont("Menlo", 11))
+        self.report.setMinimumHeight(120)
+        self.report.setPlaceholderText("合并结果会显示在这里：每份文件取到多少词、总共去掉多少重复。")
+
+        self.merge_btn = QPushButton("开始合并")
+        self.merge_btn.setMinimumHeight(36)
+        self.merge_btn.setStyleSheet(
+            "QPushButton{background:#2563eb;color:white;border-radius:8px;font-weight:600}"
+            "QPushButton:disabled{background:#9db8ea}"
+        )
+        self.merge_btn.clicked.connect(self.merge)
+        self.open_btn = QPushButton("打开所在文件夹")
+        self.open_btn.setEnabled(False)
+        self.open_btn.clicked.connect(self._open_result)
+        close = QPushButton("关闭")
+        close.clicked.connect(self.accept)
+        actions = QHBoxLayout()
+        actions.addWidget(self.merge_btn, 2)
+        actions.addWidget(self.open_btn)
+        actions.addWidget(close)
+
+        out_row = QHBoxLayout()
+        out_row.addWidget(QLabel("输出文件："))
+        out_row.addWidget(self.out_field, 1)
+        out_row.addWidget(pick_out)
+
+        layout = QVBoxLayout()
+        intro = QLabel(
+            "把要合并的「重难点词汇表」拖进下面的列表（或用「添加文件夹…」整个文件夹加进来）。\n"
+            "两张表分别合并、分别去重：阅读词汇按单词去重，同一个词的多个词性和释义会并成一行；\n"
+            "语法词汇变形按「基础词 + 变形词」去重。全部在你自己的电脑上完成，几秒钟就好。"
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        layout.addWidget(self.files, 1)
+        layout.addLayout(buttons)
+        layout.addWidget(self.count_label)
+        layout.addLayout(out_row)
+        layout.addWidget(self.report, 1)
+        layout.addLayout(actions)
+        self.setLayout(layout)
+        self._refresh_count()
+
+    # --- files
+
+    def _refresh_count(self) -> None:
+        count = self.files.count()
+        self.count_label.setText(f"已选 {count} 份文件" if count else "还没有选文件")
+        self.merge_btn.setEnabled(count > 0)
+
+    def pick_files(self) -> None:
+        names, _ = QFileDialog.getOpenFileNames(
+            self, "选择词汇表", str(self._start_dir), "Word 文档 (*.docx)"
+        )
+        if names:
+            self.files.add([Path(n) for n in names])
+
+    def pick_folder(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "选择装着词汇表的文件夹", str(self._start_dir))
+        if folder:
+            added = self.files.add([Path(folder)])
+            if not added:
+                self.report.setPlainText(f"{folder}\n里面没有找到 .docx 文件（或都已经在列表里了）。")
+
+    def pick_out(self) -> None:
+        name, _ = QFileDialog.getSaveFileName(
+            self, "合并结果保存为", self.out_field.text(), "Word 文档 (*.docx)"
+        )
+        if name:
+            self.out_field.setText(name)
+
+    # --- merging
+
+    def merge(self) -> None:
+        paths = self.files.paths()
+        out = Path(self.out_field.text().strip()).expanduser()
+        if not out.name.endswith(".docx"):
+            self.report.setPlainText("输出文件名要以 .docx 结尾。")
+            return
+
+        def job() -> tuple[bool, str]:
+            # Imported here, like the pipeline is in Worker.run: nothing about starting the
+            # app should depend on this feature loading.
+            import merge_vocab_docx as mv
+
+            lines: list[str] = []
+            try:
+                out.parent.mkdir(parents=True, exist_ok=True)
+                mv.merge_handouts(paths, out, log=lines.append)
+            except Exception as exc:  # noqa: BLE001
+                lines.append(f"失败：{exc}")
+                return False, "\n".join(lines)
+            return True, "\n".join(lines)
+
+        self.merge_btn.setEnabled(False)
+        self.open_btn.setEnabled(False)
+        self.report.setPlainText("正在合并…")
+
+        thread = QThread(self)
+        check = _Check(job)
+        check.moveToThread(thread)
+        thread.started.connect(check.run)
+        # A *bound method* of the dialog, not a closure: a plain function has no receiver
+        # object, so Qt runs it in whichever thread emitted — here the worker — and every
+        # line below would be touching widgets from the wrong thread ("Cannot create
+        # children for a parent that is in a different thread"). Connecting a method of a
+        # QObject that lives on the UI thread makes the delivery queued and safe.
+        self._pending_out = out
+        self._pending_thread = thread
+        check.finished.connect(self._merge_finished)
+        thread.finished.connect(thread.deleteLater)
+        self._check = check  # keep it alive until the thread finishes
+        thread.start()
+
+    def _merge_finished(self, ok: bool, message: str) -> None:
+        self.report.setPlainText(message)
+        self.merged = self._pending_out if ok else None
+        self.open_btn.setEnabled(ok)
+        self.merge_btn.setEnabled(True)
+        self._pending_thread.quit()
+
+    def _open_result(self) -> None:
+        if self.merged:
+            subprocess.run(["open", str(self.merged.parent)], check=False)
 
 
 def papers_in(folder: Path) -> list[Path]:
@@ -1146,14 +1386,27 @@ class Window(QMainWindow):
         for button in (self.w_vocab_full, self.w_vocab_hard):
             button.toggled.connect(self._refresh_summary)
 
+        # Merging is not a third mode — it does not touch this run at all. It sits here
+        # because this is where the teacher is already thinking about word lists, and the
+        # sheet she wants at revision time is every run's list on one page.
+        merge = QPushButton("合并已有词汇表…")
+        merge.setToolTip(
+            "把之前生成的多份「重难点词汇表」合并成一份，去掉重复的词。\n"
+            "在你自己的电脑上完成，跟本次整理无关，随时可以用。"
+        )
+        merge.clicked.connect(self.merge_vocab)
+
         vocab_row = QHBoxLayout()
         vocab_row.addWidget(QLabel("词汇表"))
         vocab_row.addWidget(self.w_vocab_full)
         vocab_row.addWidget(self.w_vocab_hard)
+        vocab_row.addWidget(merge)
         vocab_row.addStretch(1)
         vocab_holder = QWidget()
         vocab_holder.setLayout(vocab_row)
-        vocab_holder.setMaximumWidth(560)
+        # 560 was the width of the two radio buttons alone; the 合并 button needs the rest,
+        # and at 560 it was squeezed to 「合并已有词…」.
+        vocab_holder.setMaximumWidth(760)
         lay.addWidget(vocab_holder)
 
         self.basic_summary = QLabel("")
@@ -1399,6 +1652,26 @@ class Window(QMainWindow):
     def vocab_mode(self) -> str:
         """完整 = chunked, 困难 = whole."""
         return "chunked" if self.w_vocab_full.isChecked() else "whole"
+
+    def merge_vocab(self) -> None:
+        """Open the local word-list merger.
+
+        Allowed while a run is in progress: it reads finished handouts and writes a new
+        file of its own, so it cannot collide with the run — and refusing would be
+        confusing during the ten minutes a teacher is most likely to be waiting.
+        """
+        import merge_vocab_docx as mv
+
+        exports = self.output_dir / "docx_exports"
+        # Pre-filled with the last run's own handout folder, because that is where the
+        # files are, and pre-seeded with what is already in it: the common case is
+        # 「把我这学期生成的都合起来」, and that folder is the answer.
+        dialog = MergeVocabDialog(self, exports / mv.MERGED, exports if exports.is_dir() else self.output_dir)
+        if exports.is_dir():
+            dialog.files.add([exports])
+        dialog.exec()
+        if dialog.merged:
+            self.log.appendPlainText(f"已合并词汇表：{dialog.merged}")
 
     def _page(self, inner: QWidget) -> QScrollArea:
         """Wrap a tab page so it scrolls itself.
@@ -1824,6 +2097,12 @@ def selftest() -> int:
     import answer_explanation  # noqa: F401
     import export_vocab_docx  # noqa: F401
     import usage_report
+
+    # 合并词汇表 imports this lazily when the dialog opens, so a build that dropped it
+    # would look perfectly healthy right up until the teacher clicked the button.
+    import merge_vocab_docx
+
+    assert callable(merge_vocab_docx.merge_handouts)
 
     # The explanation prompts are data, not code, so PyInstaller only ships them if
     # the build passes --add-data. Load one through the pipeline's own lookup — the

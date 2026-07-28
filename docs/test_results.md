@@ -1,6 +1,14 @@
 # Test Results & Benchmarks
 
-- **自动化回归**: `python3 tests/run_tests.py` — **201 passed, 0 failed**（v0.8）。
+- **自动化回归**: `python3 tests/run_tests.py` — **255 passed, 0 failed**（v0.11）。
+  新增 `test_merge_vocab.py`（18 条）：把导出器自己写出的 docx 读回来、四条去重规则、
+  认不出的表跳过而不猜、一份都认不出就报错不写空表、合并两遍结果不变，
+  以及一条 offscreen 的对话框端到端测试（**结果回调必须落在界面线程上**）。
+  跑测试要用装了 PySide6 的解释器（`.venv/bin/python`）；`test_cancel.py` 会占用约 60 秒
+  等它那个「永不应答」的测试服务器释放，那是正常的，不是卡死。
+- **合并词汇表实测**（老师手上 9 份词汇表，其中 2 份是阅读/语法分开的）：
+  阅读词汇 **1166 → 1032**，语法变形 **837 → 713**，两秒出结果，零 API 调用。
+- **v0.8 基准**: `python3 tests/run_tests.py` — **201 passed, 0 failed**。
   新增：`test_providers.py`（每家 provider 的 payload 快照 + 会话预算）、
   `test_vocab_paper_input.py`（两种词汇模式 + 切块边界 + 答案区必须被砍掉）、
   `test_mineru_ingest.py`、`test_export_gate.py`（闸门按词表自带的模式分派）。

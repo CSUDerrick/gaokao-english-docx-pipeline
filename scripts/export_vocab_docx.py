@@ -15,6 +15,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from docx.table import _Cell
+
 import docx_splice as ds
 from bundle_paths import template_dir
 
@@ -70,16 +72,26 @@ def collect_forms(rows: list[dict]) -> list[tuple[str, str, str, str, str]]:
 
 
 def _add_table(doc, header: tuple[str, ...], rows: list[tuple[str, ...]]) -> None:
-    table = doc.add_table(rows=len(rows) + 1, cols=len(header))
+    """Fill one bordered table, linear in row count.
+
+    Do not index `table.cell(r, col)` here: python-docx rebuilds the whole cell grid on
+    every call, so filling the table is quadratic. One paper's ~250 rows hid it; merging
+    a term's worth of papers into one list (1000+ rows) spent 60–80s per table. Walking
+    each new row's own `tc` elements is the same output — no merged cells in these two
+    tables — and finishes instantly.
+    """
+    table = doc.add_table(rows=0, cols=len(header))
     ds.set_table_borders(table)
     ds.fit_table_to_window(table)
+    style = doc.styles[ds.VOCAB_BODY]
 
     for r, values in enumerate([header, *rows]):
-        for col in range(len(header)):
-            cell = table.cell(r, col)
+        tr = table.add_row()._tr
+        for col, tc in enumerate(tr.tc_lst):
+            cell = _Cell(tc, table)
             cell.text = values[col] if col < len(values) else ""
             paragraph = cell.paragraphs[0]
-            paragraph.style = doc.styles[ds.VOCAB_BODY]
+            paragraph.style = style
             for run in paragraph.runs:
                 run.bold = r == 0  # header row only
 

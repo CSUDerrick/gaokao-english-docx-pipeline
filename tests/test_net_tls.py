@@ -51,7 +51,12 @@ def _self_signed(tmp: Path) -> tuple[Path, Path]:
 class _Server:
     def __init__(self, cert: Path, key: Path):
         self.httpd = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        # The real stdlib class, not whatever is bound to ssl.SSLContext right now: once
+        # any module in this process has called net_tls.install(), that name is
+        # truststore's subclass, which verifies the peer — and a server socket has no peer
+        # to verify, so wrap_socket() dies before the test starts. The suite used to be
+        # safe only by import order, i.e. by luck.
+        context = net_tls.STDLIB_SSL_CONTEXT(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(certfile=str(cert), keyfile=str(key))
         self.httpd.socket = context.wrap_socket(self.httpd.socket, server_side=True)
         self.port = self.httpd.server_address[1]

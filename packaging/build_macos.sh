@@ -82,6 +82,7 @@ rm -rf build dist || rm -rf build dist
   --hidden-import docx_splice \
   --hidden-import export_docx_splice \
   --hidden-import export_vocab_docx \
+  --hidden-import merge_vocab_docx \
   --hidden-import model_presets \
   --hidden-import providers \
   --hidden-import usage_report \

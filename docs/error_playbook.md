@@ -77,6 +77,51 @@
 
 ---
 
+## E4 · 「合并词汇表」把每一份都报成「没找到词汇表」（lxml 的 `itertext()` 把文本吐三遍）
+
+- **症状**：合并功能第一版**全盘失效**。9 份确实是本工具生成的词汇表，
+  每一行都是 `xxx.docx：跳过（没找到词汇表）`，最后报
+  `这些文件里没有认得出来的词汇表`。文件本身用 Word 打开完全正常。
+
+- **根因**：读单元格文本用了 lxml 的 `tc.itertext()`。在 **python-docx 的自定义元素类**上，
+  它把每个 run 的文本**吐三遍**——表头「英文单词」读回来是「英文单词英文单词英文单词」，
+  于是没有一张表的表头能匹配上，全部被「认不出就跳过」的规则跳掉了。
+  这个失效模式很毒：跳过逻辑本身是对的（fail-closed），所以错误信息完全指向错的方向。
+
+- **修复**：改用项目自己的 `docx_blocks.node_text()`（只收 `w:t`，顺带把 `w:tab`/`w:br` 变成
+  `\t`/`\n`）。顺便：表头比较前去掉空格和 **nbsp**——Word 另存会塞进来。
+
+- **护栏**（`tests/test_merge_vocab.py`）：
+  `test_a_handout_written_by_the_exporter_can_be_read_back`——用**导出器自己写出的 docx**
+  往回读，不是手搓 XML 的 fixture。跳过这个往返，就看不见这个 bug。
+
+---
+
+## E5 · 后台任务的结果回调跑在工作线程上（Qt：`Cannot create children for a parent that is in a different thread`）
+
+- **症状**：点「API 密钥…→测试」或「合并已有词汇表…」，控制台打出
+  `QObject: Cannot create children for a parent that is in a different thread.`
+  界面看起来还是对的——这类跨线程动控件通常**不当场崩**，只是随时可以崩。
+
+- **根因**：`_Check.finished` 连的是一个**闭包**。闭包不是 QObject，这条连接没有 receiver object，
+  Qt 于是在**发信号的那个线程**（工作线程）里执行它——而闭包里全是
+  `self.status.setText(...)` / `self.report.setPlainText(...)`。
+
+- **修复**：改连 **QObject 的绑定方法**（`self._check_finished` / `self._merge_finished`）。
+  接收者住在界面线程，自动连接就变成排队投递，回调回到界面线程执行。
+
+- **护栏**（`tests/test_merge_vocab.py::test_the_dialog_merges_what_was_dropped_on_it_and_reports_it_on_the_ui_thread`）：
+  offscreen 起一个真 dialog，跑一次真合并，断言回调所在线程 **is** 界面线程。
+  **注意**：观察方式必须是**子类覆写**那个方法。用 monkeypatch 把它换成普通函数，
+  就又变成 functor 连接——等于亲手把这个 bug 造回来，然后测试通过。
+
+- **附带发现**：`tests/test_net_tls.py` 的通过**只靠导入顺序**。任何模块调过 `net_tls.install()`
+  之后，`ssl.SSLContext` 就是 truststore 的子类（它会验证对端，而服务端 socket 没有对端），
+  测试里那个 HTTPS 服务器 `wrap_socket()` 直接挂。新测试导入了 `app/main.py`（顶部就 `install()`）
+  就把它掀了。修复：`net_tls` 导出注入前捕获的 `STDLIB_SSL_CONTEXT`，测试拿它建服务端上下文。
+
+---
+
 ## E2 · 输入本身是坏的（OCR 乱码 / 近乎空白 / 抽取错乱）
 
 - **症状**：不是这次那个报错，而是更隐蔽——喂进去的 docx / PDF-OCR 文本已经是乱码或残缺，

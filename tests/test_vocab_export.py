@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 
@@ -78,6 +79,31 @@ def test_handout_has_exactly_the_two_tables_with_the_asked_for_headers():
         # header row + one row per entry
         assert len(list(tables[0].iter(W + "tr"))) == 1 + 3
         assert len(list(tables[1].iter(W + "tr"))) == 1 + 1
+
+
+def test_a_whole_terms_worth_of_words_still_builds_in_seconds():
+    # A merged handout (every paper of a term in one list) is ~1000 rows. Filling the
+    # table by `table.cell(r, col)` makes
+    # python-docx rebuild the cell grid per call — quadratic, 60-80s per table at that
+    # size. Generous budget: the point is to catch a return to quadratic, not to measure
+    # this machine.
+    rows = [{
+        "reading_words": [
+            {"word": f"word{i}", "pos": "n.", "meaning": f"释义 {i}"} for i in range(800)
+        ],
+        "word_forms": [
+            {"base": f"base{i}", "base_pos": "v.", "derived": f"derived{i}",
+             "derived_pos": "n.", "note": "加后缀"} for i in range(800)
+        ],
+    }]
+    with tempfile.TemporaryDirectory() as tmp:
+        start = time.monotonic()
+        out = ev.build(rows, Path(tmp) / "v.docx")
+        elapsed = time.monotonic() - start
+
+        assert len(list(_tables(out)[0].iter(W + "tr"))) == 1 + 800
+        assert len(list(_tables(out)[1].iter(W + "tr"))) == 1 + 800
+        assert elapsed < 15, f"1600 行用了 {elapsed:.1f}s——填表又变成 O(行数²) 了"
 
 
 def test_handout_draws_borders_without_naming_a_style():

@@ -47,6 +47,9 @@ python3 scripts/gaokao_english_docx_pipeline.py input_docx --out outputs/gaokao_
 #   完整（分块）——逐题提词，词表逐题对应学生手上的卷子
 python3 scripts/gaokao_english_docx_pipeline.py input_docx --out outputs/gaokao_english --mode vocab --vocab-mode chunked
 
+# 合并多份已生成的词汇表（纯本地，不调 AI，没配密钥也能跑）。界面：基础模式「合并已有词汇表…」
+python3 scripts/merge_vocab_docx.py outputs/gaokao_english/docx_exports --out 汇总词汇表.docx
+
 # Word 导出（克隆原卷排版，不经过 Markdown）
 python3 scripts/gaokao_english_docx_pipeline.py input_docx --out outputs/gaokao_english --mode export-docx
 
@@ -96,6 +99,17 @@ streamlit run gui_app.py
   新题没有解析——`assert_selection_is_complete()` 会在导出前拦住。
   **vocab 要不要补跑，取决于老师选的模式**（决策 33）：分块词表换题就过期（必须重跑），
   整卷词表不会（词属于卷，卷没变）。
+
+- **合并词汇表按「单词」去重、按「义项」并释义（决策 37），别改成按 (词, 词性) 去重。**
+  一个学期里约 9 个词的词性在不同卷子里真的不同（`yield` n. 产量 / v. 屈服）——按 (词, 词性)
+  去重会把同一个词印两遍还不说它们是一个词。释义也不能拼整串：三份卷子写「大量，丰富」
+  「丰富，充裕」「充裕，大量」是同一个词的三个义项，拼串会把每个义项印三遍。
+  **考点说明只取一条**（只差空格的两种写法拼起来 = 给学生印两遍）。
+  - **读表格文本必须用 `docx_blocks.node_text`。** lxml 的 `itertext()` 在 python-docx 的元素类上
+    把每个 run 吐**三遍**，「英文单词」变成「英文单词英文单词英文单词」，于是一张表都认不出来——
+    这功能第一版就是这么全盘失效的。
+  - **认不出表头就跳过并说出来，一份都认不出就报错。** 三列表格不等于词汇表；猜错等于把
+    没人选过的词印到学生纸上。识别前要去掉空格和 nbsp（Word 另存会加）。
 
 - **词汇表有两条路，别再单方面砍掉一条。** 上一版把「逐题分块」直接换成「整卷」，那是越权——
   哪条更好取决于老师怎么用这张纸。两条都留着，基础模式二选一：

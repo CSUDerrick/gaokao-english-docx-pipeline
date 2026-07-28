@@ -53,6 +53,8 @@ in front of her rather than this file making it for her.
 | `scripts/model_presets.py` | The two quality presets (speed/quality); shared by the CLI and the GUI |
 | `prompts/*.md` | The per-question-type explanation prompts — editable, shipped as bundle data |
 | `scripts/export_docx_splice.py` | Builds the Word deliverables from the clones |
+| `scripts/export_vocab_docx.py` | Builds the student word-list handout (the two tables) |
+| `scripts/merge_vocab_docx.py` | Merges word-list handouts already on disk into one deduped handout — local only, no API (决策 37) |
 | `scripts/segment_quality.py` | Shared PASS/PASS*/WARN/FAIL evaluator used by fallback and reports |
 | `scripts/check_segment_quality.py` | Batch segment quality report using shared rules |
 | `gui_app.py` | Education-blue Streamlit GUI with Basic/Advanced/Debug modes |
